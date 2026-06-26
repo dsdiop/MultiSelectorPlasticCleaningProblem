@@ -92,9 +92,12 @@ class TBLogger:
                 if isinstance(v, (int, float)):
                     self.writer.add_scalar(f"{tag_prefix}/{k}", float(v), e)
         try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
+            import contextlib
+            import io
+            with contextlib.redirect_stderr(io.StringIO()):
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
             fig, ax = plt.subplots(figsize=(4, 4))
             pts = pareto_result["all_points"]
             front = pareto_result["pareto_front"]

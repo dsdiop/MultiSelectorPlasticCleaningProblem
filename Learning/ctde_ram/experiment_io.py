@@ -185,9 +185,12 @@ def save_pareto_artifacts(result: dict, out_dir: str, prefix: str) -> dict:
 
 def plot_pareto(result: dict, path: str) -> bool:
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()):
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
     except Exception as exc:
         print(f"[plot] skipped pareto plot: {exc!r}")
         return False

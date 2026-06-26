@@ -28,6 +28,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
+try:
     from .nets import (
         DuelingNuQNetwork,
         SharedEncoder,
@@ -59,6 +64,25 @@ except ImportError:
     from tb_logger import TBLogger
 
 
+def _progress(iterable, **kwargs):
+    if tqdm is None:
+        return iterable
+    return tqdm(iterable, dynamic_ncols=True, **kwargs)
+
+
+def _progress_write(message: str) -> None:
+    if tqdm is not None:
+        tqdm.write(message)
+    else:
+        print(message)
+
+
+def _tensor_to_numpy(value, dtype=np.float32):
+    if torch.is_tensor(value):
+        value = value.detach().cpu().tolist()
+    return np.asarray(value, dtype=dtype)
+
+
 class RewardMinMaxNormalizer:
     """Greedy-agent style component normalizer for role-level scalarization.
 
@@ -80,7 +104,7 @@ class RewardMinMaxNormalizer:
         return bool(np.all(np.isfinite(self.min_value)) and np.all(np.isfinite(self.max_value)))
 
     def update(self, values) -> None:
-        arr = np.asarray(values.detach().cpu().numpy() if torch.is_tensor(values) else values, dtype=np.float32)
+        arr = _tensor_to_numpy(values, dtype=np.float32)
         arr = arr.reshape(-1, self.dim)
         self.min_value = np.minimum(self.min_value, arr.min(axis=0))
         self.max_value = np.maximum(self.max_value, arr.max(axis=0))
@@ -125,7 +149,7 @@ class RunningMeanStdNormalizer:
         return float(np.sqrt(max(self.m2 / (self.count - 1), self.eps)))
 
     def update(self, values) -> None:
-        arr = np.asarray(values.detach().cpu().numpy() if torch.is_tensor(values) else values, dtype=np.float32)
+        arr = _tensor_to_numpy(values, dtype=np.float32)
         for x in arr.reshape(-1):
             self.count += 1
             delta = float(x) - self.mean
@@ -560,7 +584,7 @@ class CTDERAMTrainer:
     def _roles_to_W(self, roles) -> torch.Tensor:
         roles = np.asarray(roles, dtype=np.int64)
         W = torch.zeros(self.N, self.K, device=self.device)
-        W[torch.arange(self.N, device=self.device), torch.as_tensor(roles, device=self.device)] = 1.0
+        W[torch.arange(self.N, device=self.device), torch.as_tensor(roles, dtype=torch.long, device=self.device)] = 1.0
         return W
 
     def _roles_to_combo_idx(self, roles_t: torch.Tensor) -> torch.Tensor:
@@ -725,7 +749,7 @@ class CTDERAMTrainer:
         # owns navigation), so warmup only seeds the RAM reward statistics and
         # drives the env with random soft roles instead of movement actions.
         expert_nu_mode = self._env_uses_expert_nu(env)
-        for _ in range(int(n_episodes)):
+        for _ in _progress(range(int(n_episodes)), desc="warmup", unit="ep", leave=False):
             obs_all = env.reset()
             prev_metrics = {
                 "trash_cleaned": self._env_value(env, "trash_cleaned_pct", 0.0),
@@ -829,7 +853,7 @@ class CTDERAMTrainer:
           path planner is the fixed Expert_nu checkpoint, not a learner here.
         """
         if self._env_uses_expert_nu(env):
-            obs_next, r_vecs, done, info = env.step(W.detach().cpu().numpy())
+            obs_next, r_vecs, done, info = env.step(_tensor_to_numpy(W, dtype=np.float32))
             return obs_next, r_vecs, done, info, None
 
         actions = [self.select_action(obs_all[i], W[i], epsilon_low) for i in range(self.N)]
@@ -872,14 +896,14 @@ class CTDERAMTrainer:
                     target=False,
                 ).squeeze(0)
                 W = self._soft_weights_from_q(q_roles)
-            roles = W.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
+            roles = _tensor_to_numpy(W.argmax(dim=-1), dtype=np.int64)
             return roles, W
 
         if self.rng.random() < epsilon_ram:
             roles = self.rng.integers(0, self.K, size=self.N, dtype=np.int64)
         else:
             q = self.ram_q(role_state.unsqueeze(0)).view(self.N, self.K)
-            roles = q.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
+            roles = _tensor_to_numpy(q.argmax(dim=-1), dtype=np.int64)
         return roles, self._roles_to_W(roles)
 
     # ---------- low-level update ----------
@@ -1010,8 +1034,8 @@ class CTDERAMTrainer:
         role_counts = np.zeros(self.K, dtype=np.float64)
         W_sum = np.zeros(self.K, dtype=np.float64)
         n_role_decisions = 0
-        role_counts += np.bincount(W.argmax(dim=-1).detach().cpu().numpy(), minlength=self.K)
-        W_sum += W.detach().cpu().numpy().mean(axis=0)
+        role_counts += np.bincount(_tensor_to_numpy(W.argmax(dim=-1), dtype=np.int64), minlength=self.K)
+        W_sum += _tensor_to_numpy(W, dtype=np.float32).mean(axis=0)
         n_role_decisions += 1
         z_all_prev, extra_prev = z_all, extra
 
@@ -1077,12 +1101,12 @@ class CTDERAMTrainer:
                 z_next = self._encode_all(obs_all).detach()
                 extra_next = self._build_extra(env, r_accum, W, scal_weights)
                 self.buf_role.store(
-                    z_all_prev.cpu().numpy(),
-                    extra_prev.cpu().numpy(),
-                    W.detach().cpu().numpy(),
+                    _tensor_to_numpy(z_all_prev, dtype=np.float32),
+                    _tensor_to_numpy(extra_prev, dtype=np.float32),
+                    _tensor_to_numpy(W, dtype=np.float32),
                     R_role,
-                    z_next.cpu().numpy(),
-                    extra_next.cpu().numpy(),
+                    _tensor_to_numpy(z_next, dtype=np.float32),
+                    _tensor_to_numpy(extra_next, dtype=np.float32),
                     done,
                 )
 
@@ -1097,8 +1121,8 @@ class CTDERAMTrainer:
                     m["n_switches"] += 1
                 z_all_prev, extra_prev = z_next, extra_next
                 roles, W, prev_W = new_roles, new_W, new_W
-                role_counts += np.bincount(W.argmax(dim=-1).detach().cpu().numpy(), minlength=self.K)
-                W_sum += W.detach().cpu().numpy().mean(axis=0)
+                role_counts += np.bincount(_tensor_to_numpy(W.argmax(dim=-1), dtype=np.int64), minlength=self.K)
+                W_sum += _tensor_to_numpy(W, dtype=np.float32).mean(axis=0)
                 n_role_decisions += 1
                 window_start_metrics = curr_metrics
                 R_role = 0.0
@@ -1128,12 +1152,20 @@ class CTDERAMTrainer:
 
     # ---------- greedy single-weight evaluation ----------
     @torch.no_grad()
-    def _evaluate_single(self, env, scal_weights, n_episodes: int = 5):
+    def _evaluate_single(self, env, scal_weights, n_episodes: int = 5, show_progress: bool = False, progress_desc: Optional[str] = None):
         scal_weights = np.asarray(scal_weights, dtype=np.float32)
         scal_weights = scal_weights / max(float(scal_weights.sum()), 1e-8)
         results = []
         role_counts = np.zeros(self.K, dtype=np.int64)
-        for _ in range(n_episodes):
+        episode_iter = range(n_episodes)
+        if show_progress:
+            episode_iter = _progress(
+                episode_iter,
+                desc=progress_desc or "eval episodes",
+                unit="ep",
+                leave=False,
+            )
+        for _ in episode_iter:
             obs_all = env.reset()
             done = False
             ep_step = 0
@@ -1157,7 +1189,7 @@ class CTDERAMTrainer:
                     if not torch.equal(new_W, W):
                         metrics["n_switches"] += 1
                     W = new_W
-                    for k in W.argmax(dim=-1).cpu().numpy():
+                    for k in _tensor_to_numpy(W.argmax(dim=-1), dtype=np.int64):
                         role_counts[k] += 1
                     r_accum = torch.zeros(self.K, device=self.device)
             metrics["coverage"] = self._env_value(env, "coverage_pct", 0.0)
@@ -1245,7 +1277,7 @@ class CTDERAMTrainer:
             scal_grid = [(1.0, 0.0), (0.75, 0.25), (0.5, 0.5), (0.25, 0.75), (0.0, 1.0)]
 
         rows = []
-        for scal_weights in scal_grid:
+        for scal_weights in _progress(list(scal_grid), desc="probe weights", unit="w", leave=False):
             scal_weights = np.asarray(scal_weights, dtype=np.float32)
             scal_weights = scal_weights / max(float(scal_weights.sum()), 1e-8)
             W_records = []
@@ -1253,7 +1285,13 @@ class CTDERAMTrainer:
             coverages = []
             cleaned = []
 
-            for _ in range(int(n_episodes_per_w)):
+            weight_label = ",".join(f"{float(x):.2f}" for x in scal_weights)
+            for _ in _progress(
+                range(int(n_episodes_per_w)),
+                desc=f"probe episodes w=({weight_label})",
+                unit="ep",
+                leave=False,
+            ):
                 obs_all = env.reset()
                 done = False
                 ep_step = 0
@@ -1264,8 +1302,8 @@ class CTDERAMTrainer:
                 z_all = self._encode_all(obs_all).detach()
                 extra = self._build_extra(env, r_accum, prev_W, scal_weights)
                 _, W = self.select_roles(z_all, extra, epsilon_ram=0.0)
-                W_records.append(W.detach().cpu().numpy())
-                role_records.append(W.argmax(dim=-1).detach().cpu().numpy())
+                W_records.append(_tensor_to_numpy(W, dtype=np.float32))
+                role_records.append(_tensor_to_numpy(W.argmax(dim=-1), dtype=np.int64))
 
                 while not done:
                     obs_all, r_vecs, done, info, _ = self._step_env_with_current_W(
@@ -1278,8 +1316,8 @@ class CTDERAMTrainer:
                         z_next = self._encode_all(obs_all).detach()
                         extra = self._build_extra(env, r_accum, W, scal_weights)
                         _, W = self.select_roles(z_next, extra, epsilon_ram=0.0)
-                        W_records.append(W.detach().cpu().numpy())
-                        role_records.append(W.argmax(dim=-1).detach().cpu().numpy())
+                        W_records.append(_tensor_to_numpy(W, dtype=np.float32))
+                        role_records.append(_tensor_to_numpy(W.argmax(dim=-1), dtype=np.int64))
                         r_accum = torch.zeros(self.K, device=self.device)
 
                 coverages.append(self._env_value(env, "coverage_pct", 0.0))
@@ -1307,7 +1345,7 @@ class CTDERAMTrainer:
                 row["mean_nu_role1"] = float(role_frac[1])
             rows.append(row)
 
-        print("[probe] preference sensitivity")
+        _progress_write("[probe] preference sensitivity")
         for row in rows:
             argmax_bits = " ".join(
                 f"role{k}_frac={row[f'role{k}_argmax_frac']:.3f}"
@@ -1317,7 +1355,7 @@ class CTDERAMTrainer:
                 f"meanW{k}={row[f'role{k}_mean_weight']:.3f}"
                 for k in range(self.K)
             )
-            print(
+            _progress_write(
                 f"   w=({row['w0']:.2f},{row['w1']:.2f}) "
                 f"{argmax_bits} {mean_bits} "
                 f"coverage={row['coverage']:.3f} cleaned={row['trash_cleaned']:.3f}"
@@ -1331,7 +1369,7 @@ class CTDERAMTrainer:
                 writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                 writer.writeheader()
                 writer.writerows(rows)
-            print(f"[probe] wrote csv: {save_csv}")
+            _progress_write(f"[probe] wrote csv: {save_csv}")
 
         if plot_path:
             try:
@@ -1356,9 +1394,9 @@ class CTDERAMTrainer:
                 fig.tight_layout()
                 fig.savefig(plot_path, dpi=160)
                 plt.close(fig)
-                print(f"[probe] wrote plot: {plot_path}")
+                _progress_write(f"[probe] wrote plot: {plot_path}")
             except Exception as ex:
-                print(f"[probe] plot skipped: {ex!r}")
+                _progress_write(f"[probe] plot skipped: {ex!r}")
 
         return rows
 
@@ -1372,19 +1410,46 @@ class CTDERAMTrainer:
         objective_keys=("coverage", "trash_cleaned"),
         ref_point=(0.0, 0.0),
     ):
+        scal_grid = list(scal_grid)
+        eval_bar = tqdm(
+            total=len(scal_grid),
+            desc="eval weights",
+            unit="w",
+            dynamic_ncols=True,
+            leave=False,
+        ) if tqdm is not None else None
+
         def _evaluator(w):
-            mm = self._evaluate_single(env, w, n_episodes=n_episodes_per_w)
+            weight_label = ",".join(f"{float(x):.2f}" for x in w)
+            mm = self._evaluate_single(
+                env,
+                w,
+                n_episodes=n_episodes_per_w,
+                show_progress=tqdm is not None,
+                progress_desc=f"eval episodes w=({weight_label})",
+            )
             self.tb.log_role_histogram(mm.pop("_role_counts", np.zeros(self.K, dtype=np.int64)))
+            if eval_bar is not None:
+                eval_bar.set_postfix(
+                    coverage=f"{mm['coverage']:.3f}",
+                    cleaned=f"{mm['trash_cleaned']:.3f}",
+                    refresh=False,
+                )
+                eval_bar.update(1)
             return mm
 
-        result = sweep_scalarizations(_evaluator, list(scal_grid), objective_keys, ref_point)
+        try:
+            result = sweep_scalarizations(_evaluator, scal_grid, objective_keys, ref_point)
+        finally:
+            if eval_bar is not None:
+                eval_bar.close()
         self.tb.log_pareto(result)
-        print(
+        _progress_write(
             f"[eval] hypervolume={result['hypervolume']:.4f} "
             f"front_size={result['pareto_front'].shape[0]} n_points={result['all_points'].shape[0]}"
         )
         for w, mm in result["per_weight"]:
-            print(
+            _progress_write(
                 f"   w={tuple(round(float(x), 2) for x in w)} "
                 f"coverage={mm['coverage']:.3f} cleaned={mm['trash_cleaned']:.3f}"
             )

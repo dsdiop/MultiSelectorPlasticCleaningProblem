@@ -13,6 +13,12 @@ import numpy as np
 import torch
 
 try:
+    from tqdm.auto import trange, tqdm
+except ImportError:
+    trange = None
+    tqdm = None
+
+try:
     from .aquatic_env import AquaticMAEnv
     from .experiment_io import (
         append_csv_row,
@@ -56,6 +62,55 @@ def sample_weights(rng, k: int = 2, mode: str = "uniform", alpha: float = 0.5):
     w = rng.uniform(0.0, 1.0, size=k).astype(np.float32)
     s = float(w.sum())
     return (w / s) if s > 0 else np.ones(k, dtype=np.float32) / k
+
+
+def progress_write(message: str) -> None:
+    if tqdm is not None:
+        tqdm.write(message)
+    else:
+        print(message)
+
+
+def describe_device(device: str) -> str:
+    if device.startswith("cuda") and torch.cuda.is_available():
+        idx = int(device.split(":", 1)[1]) if ":" in device else torch.cuda.current_device()
+        name = torch.cuda.get_device_name(idx)
+        total_gb = torch.cuda.get_device_properties(idx).total_memory / (1024 ** 3)
+        return f"{device} ({name}, {total_gb:.1f} GB)"
+    cuda_note = "cuda unavailable" if not torch.cuda.is_available() else "cpu requested"
+    return f"cpu ({cuda_note})"
+
+
+def print_experiment_summary(args, env, low_level_backend: str, t_role: int, device: str, run_dir: str, trainer=None) -> None:
+    print("\n" + "=" * 80)
+    print("CTDE-RAM experiment")
+    print("=" * 80)
+    print(f"run_name        : {args.run_name}")
+    print(f"output_dir      : {run_dir}")
+    print(f"env/backend     : {args.env} / {low_level_backend}")
+    print(f"device          : {describe_device(device)}")
+    print(f"episodes        : {args.episodes}")
+    print(f"agents/objectives/actions : N={getattr(env, 'N', args.N)} K={env.K} A={env.A}")
+    print(f"T_role          : {t_role}")
+    print(f"seed            : {args.seed}")
+    print(f"eval            : every={args.eval_every if args.eval_every is not None else ('3 smoke' if args.smoke else '50 default')} "
+          f"episodes={args.eval_episodes if args.eval_episodes is not None else ('2 smoke' if args.smoke else '3 default')} "
+          f"points={args.eval_points}")
+    if trainer is not None:
+        print(
+            "trainer         : "
+            f"ram_mode={trainer.ram_mode} global_agg={trainer.global_agg_mode} "
+            f"soft_arch={trainer.soft_ram_arch} role_state={trainer.role_state_mode}"
+        )
+        print(
+            "scalarization   : "
+            f"role={trainer.role_scalarization} q={trainer.q_scalarization} "
+            f"reward_norm={trainer.role_reward_norm_name} gamma_role={trainer.gamma_role:.4f}"
+        )
+    print("params:")
+    for key, value in sorted(args_to_dict(args).items()):
+        print(f"  {key}: {value}")
+    print("=" * 80 + "\n")
 
 
 def parse_args(argv=None):
@@ -367,7 +422,7 @@ def main():
     ckpt_dir = ensure_dir(os.path.join(run_dir, "checkpoints"))
     fig_dir = ensure_dir(os.path.join(run_dir, "figures"))
     write_json(os.path.join(run_dir, "config.json"), args_to_dict(args))
-    print(f"[run] output_dir={run_dir}")
+    print_experiment_summary(args, env, low_level_backend, t_role, device, run_dir)
 
     trainer = build_trainer(
         args,
@@ -413,11 +468,18 @@ def main():
     eval_episodes = args.eval_episodes if args.eval_episodes is not None else (2 if args.smoke else 3)
     run_config = args_to_dict(args)
 
-    for ep in range(args.episodes):
+    if trange is not None:
+        episode_iter = trange(args.episodes, desc="train", unit="ep", dynamic_ncols=True)
+    else:
+        episode_iter = range(args.episodes)
+
+    for ep in episode_iter:
         eps_low = max(0.05, 1.0 - ep / max(1, args.episodes * 0.5))
         eps_ram = max(0.05, 1.0 - ep / max(1, args.episodes * 0.75))
         w = sample_weights(rng, env.K, mode=args.weight_sampling, alpha=args.weight_alpha)
         m = trainer.run_episode(env, w, eps_low, eps_ram)
+        head_loss = np.mean(m["head_losses"]) if m["head_losses"] else float("nan")
+        ram_loss = np.mean(m["ram_losses"]) if m["ram_losses"] else float("nan")
         train_row = {"episode": ep, "w0": float(w[0]), "w1": float(w[1]) if env.K > 1 else 0.0}
         train_row.update(m)
         append_csv_row(os.path.join(metrics_dir, "train_episodes.csv"), train_row)
@@ -426,11 +488,19 @@ def main():
         if env.K > 1:
             trainer.tb.log_scalar("train/weight_1", float(w[1]), step=ep)
         trainer.tb.flush()
-        print(
+        if tqdm is not None:
+            episode_iter.set_postfix(
+                R=f"{m['total_reward']:.2f}",
+                switches=m["n_switches"],
+                head=f"{head_loss:.4f}",
+                ram=f"{ram_loss:.4f}",
+                refresh=False,
+            )
+        progress_write(
             f"[ep {ep:4d}] w=({w[0]:.2f},{w[1]:.2f}) R={m['total_reward']:.2f} "
             f"switches={m['n_switches']} "
-            f"head_loss={np.mean(m['head_losses']) if m['head_losses'] else float('nan'):.4f} "
-            f"ram_loss={np.mean(m['ram_losses']) if m['ram_losses'] else float('nan'):.4f}"
+            f"head_loss={head_loss:.4f} "
+            f"ram_loss={ram_loss:.4f}"
         )
 
         if eval_every > 0 and ep % eval_every == 0:
@@ -460,14 +530,14 @@ def main():
                 best_hv = float(latest_eval["hypervolume"])
                 best_path = os.path.join(ckpt_dir, "best_hv.pt")
                 trainer.save_checkpoint(best_path, run_config=run_config, episode=ep, metrics={"best_hv": best_hv})
-                print(f"[checkpoint] best_hv={best_hv:.4f} saved={best_path}")
+                progress_write(f"[checkpoint] best_hv={best_hv:.4f} saved={best_path}")
 
         if args.save_every > 0 and (ep + 1) % args.save_every == 0:
             periodic_path = os.path.join(ckpt_dir, f"episode_{ep + 1:05d}.pt")
             latest_path = os.path.join(ckpt_dir, "latest.pt")
             trainer.save_checkpoint(periodic_path, run_config=run_config, episode=ep, metrics=m)
             trainer.save_checkpoint(latest_path, run_config=run_config, episode=ep, metrics=m)
-            print(f"[checkpoint] saved={periodic_path}")
+            progress_write(f"[checkpoint] saved={periodic_path}")
 
     if args.check_aggregator_grad:
         grad = trainer.last_global_agg_grad_abs_sum

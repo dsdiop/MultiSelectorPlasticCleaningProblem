@@ -17,6 +17,14 @@ import numpy as np
 import torch
 
 
+def _torch_from_array(arr, dtype=None):
+    # Use lists instead of torch.from_numpy so experiments still run in
+    # environments where Torch was built against a different NumPy ABI.
+    if dtype is None:
+        return torch.tensor(arr.tolist())
+    return torch.tensor(arr.tolist(), dtype=dtype)
+
+
 class LowLevelReplayBuffer:
     def __init__(self, capacity: int, obs_shape):
         self.capacity = capacity
@@ -44,11 +52,11 @@ class LowLevelReplayBuffer:
     def sample(self, batch_size: int):
         idx = np.random.randint(0, self.size, size=batch_size)
         return (
-            torch.from_numpy(self.obs[idx]),
-            torch.from_numpy(self.actions[idx]),
-            torch.from_numpy(self.rewards[idx]),
-            torch.from_numpy(self.next_obs[idx]),
-            torch.from_numpy(self.dones[idx]),
+            _torch_from_array(self.obs[idx], dtype=torch.float32),
+            _torch_from_array(self.actions[idx], dtype=torch.long),
+            _torch_from_array(self.rewards[idx], dtype=torch.float32),
+            _torch_from_array(self.next_obs[idx], dtype=torch.float32),
+            _torch_from_array(self.dones[idx], dtype=torch.float32),
         )
 
 
@@ -94,11 +102,11 @@ class RoleReplayBuffer:
     def sample(self, batch_size: int):
         idx = np.random.randint(0, self.size, size=batch_size)
         return (
-            torch.from_numpy(self.z[idx]),
-            torch.from_numpy(self.extra[idx]),
-            torch.from_numpy(self.role_weights[idx]),
-            torch.from_numpy(self.returns[idx]),
-            torch.from_numpy(self.next_z[idx]),
-            torch.from_numpy(self.next_extra[idx]),
-            torch.from_numpy(self.dones[idx]),
+            _torch_from_array(self.z[idx], dtype=torch.float32),
+            _torch_from_array(self.extra[idx], dtype=torch.float32),
+            _torch_from_array(self.role_weights[idx], dtype=torch.float32),
+            _torch_from_array(self.returns[idx], dtype=torch.float32),
+            _torch_from_array(self.next_z[idx], dtype=torch.float32),
+            _torch_from_array(self.next_extra[idx], dtype=torch.float32),
+            _torch_from_array(self.dones[idx], dtype=torch.float32),
         )
