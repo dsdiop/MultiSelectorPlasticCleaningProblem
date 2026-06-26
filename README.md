@@ -22,7 +22,7 @@ CTDE-RAM learns a high-level selector that assigns role/preference weights to th
 
 The most relevant implementation is in:
 
-- Learning/ctde_ram_claude/
+- Learning/ctde_ram/
 
 This package contains:
 
@@ -37,13 +37,13 @@ This package contains:
 For a lightweight smoke test:
 
 ```bash
-python Learning/ctde_ram_claude/run_experiment.py --smoke --episodes 1
+python Learning/ctde_ram/run_experiment.py --smoke --episodes 1
 ```
 
 For a real-project run using the expert_nu path-planner substrate:
 
 ```bash
-python Learning/ctde_ram_claude/run_experiment.py \
+python Learning/ctde_ram/run_experiment.py \
   --env project \
   --project-control expert_nu \
   --path-planner-folder <folder_name> \
@@ -61,7 +61,7 @@ python Learning/ctde_ram_claude/run_experiment.py \
 
 For detailed usage, training flags, evaluation, and diagnostics, see:
 
-- Learning/ctde_ram_claude/README.md
+- Learning/ctde_ram/README.md
 
 ## Notes
 
