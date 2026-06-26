@@ -490,6 +490,7 @@ def main():
         trainer.tb.flush()
         if tqdm is not None:
             episode_iter.set_postfix(
+                w=f"({w[0]:.2f},{w[1]:.2f})",
                 R=f"{m['total_reward']:.2f}",
                 switches=m["n_switches"],
                 head=f"{head_loss:.4f}",

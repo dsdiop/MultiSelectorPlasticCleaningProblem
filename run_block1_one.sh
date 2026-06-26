@@ -238,7 +238,7 @@ CMD_FILE="${LOG_DIR}/${RUN_NAME}.cmd.sh"
 } > "${CMD_FILE}"
 chmod +x "${CMD_FILE}"
 
-# ---- Launch one tmux session, one training process ---------------------------
+# ---- Launch one tmux session, one training process, kill tmux terminal after completion ---------------------------
 
 echo "[launch] experiment: ${EXP_RAW}"
 echo "[launch] run_name:   ${RUN_NAME}"
@@ -248,8 +248,11 @@ echo "[launch] log:        ${LOG_FILE}"
 echo "[launch] command:    ${CMD_FILE}"
 echo
 
+# 1. Ejecutamos el bloque de comandos. Al terminar el último comando, la sesión morirá sola.
 tmux new-session -d -s "${SESSION_NAME}" bash -lc "
-    set -euo pipefail
+    # Nota: Quitamos 'set -e' temporalmente para que el bloque final de 'echo' 
+    # se ejecute incluso si tu script de entrenamiento falla (exit code > 0).
+    set -uo pipefail
     cd '${PROJECT_ROOT}'
 
     echo '============================================================'
@@ -262,24 +265,29 @@ tmux new-session -d -s "${SESSION_NAME}" bash -lc "
     echo '============================================================'
     echo
 
+    # Guardamos el código de salida del entrenamiento
+    set +e
     '${CMD_FILE}' 2>&1 | tee '${LOG_FILE}'
+    TRAIN_EXIT_CODE=\${PIPESTATUS[0]}
+    set -e
 
     echo
     echo '============================================================'
-    echo '[done] ${RUN_NAME}'
+    echo '[done] ${RUN_NAME} con estado \${TRAIN_EXIT_CODE}'
     echo '[finish]' \$(date)
     echo '============================================================'
 
-    exec bash
+    # 2. Forzamos la salida devolviendo el estado real del entrenamiento
+    exit \${TRAIN_EXIT_CODE}
 "
 
 echo "[ok] launched."
 echo
-echo "Attach:"
+echo "Attach (solo mientras entrene):"
 echo "  tmux attach -t ${SESSION_NAME}"
 echo
 echo "Detach inside tmux:"
 echo "  Ctrl+B, then D"
 echo
-echo "Tail log:"
+echo "Tail log (disponible siempre):"
 echo "  tail -f '${LOG_FILE}'"
