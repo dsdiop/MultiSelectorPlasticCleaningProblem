@@ -1625,8 +1625,10 @@ class CTDERAMTrainer:
         n_episodes_per_w: int = 3,
         objective_keys=("coverage", "trash_cleaned"),
         ref_point=(0.0, 0.0),
+        progress_callback=None,
     ):
         scal_grid = list(scal_grid)
+        completed_weights = 0
         eval_bar = tqdm(
             total=len(scal_grid),
             desc="eval weights",
@@ -1636,6 +1638,7 @@ class CTDERAMTrainer:
         ) if tqdm is not None else None
 
         def _evaluator(w):
+            nonlocal completed_weights
             weight_label = ",".join(f"{float(x):.2f}" for x in w)
             mm = self._evaluate_single(
                 env,
@@ -1647,11 +1650,15 @@ class CTDERAMTrainer:
             self.tb.log_role_histogram(mm.pop("_role_counts", np.zeros(self.K, dtype=np.int64)))
             if eval_bar is not None:
                 eval_bar.set_postfix(
+                    w=f"({weight_label})",
                     coverage=f"{mm['coverage']:.3f}",
                     cleaned=f"{mm['trash_cleaned']:.3f}",
                     refresh=False,
                 )
                 eval_bar.update(1)
+            completed_weights += 1
+            if progress_callback is not None:
+                progress_callback(w, dict(mm), completed_weights, len(scal_grid))
             return mm
 
         try:
