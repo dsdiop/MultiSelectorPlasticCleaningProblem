@@ -1259,7 +1259,17 @@ class CTDERAMTrainer:
                 m["total_reward"] += R_step
                 learning_R_role = R_role - window_switch_penalty
                 z_next = self._encode_all(obs_all).detach()
-                extra_next = self._build_extra(env, r_accum, W, scal_weights)
+                ram_state_r = (
+                    r_accum
+                    if self.ram_reward_mode == "delta_metrics"
+                    else window_r_components
+                )
+                if (
+                    self.ram_reward_mode == "component_rewards"
+                    and self.role_reward_norm_name == "minmax"
+                ):
+                    ram_state_r = self.role_reward_norm.normalize_tensor(ram_state_r)
+                extra_next = self._build_extra(env, ram_state_r, W, scal_weights)
                 self.buf_role.store(
                     _tensor_to_numpy(z_all_prev, dtype=np.float32),
                     _tensor_to_numpy(extra_prev, dtype=np.float32),
