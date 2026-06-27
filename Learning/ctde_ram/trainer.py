@@ -224,6 +224,7 @@ class CTDERAMTrainer:
         #                with parameters independent of K^N.
         soft_ram_arch: str = "attention",
         soft_ram_temperature: float = 1.0,
+        w_execution: str = "soft",
         # role_state_mode controls the mission/context vector appended to g.
         #
         #   flat   -> previous W is flattened; matches the original toy implementation,
@@ -277,6 +278,7 @@ class CTDERAMTrainer:
         self.global_agg_mode = global_agg_mode
         self.soft_ram_arch = soft_ram_arch
         self.soft_ram_temperature = float(soft_ram_temperature)
+        self.w_execution = w_execution
         self.role_scalarization = role_scalarization.lower()
         self.q_scalarization = q_scalarization.lower()
         self.scalarization_power = float(scalarization_power)
@@ -322,6 +324,8 @@ class CTDERAMTrainer:
             raise ValueError("global_agg_mode must be one of: attention, mean_pool")
         if self.soft_ram_arch not in {"mlp", "attention"}:
             raise ValueError("soft_ram_arch must be one of: mlp, attention")
+        if self.w_execution not in {"soft", "hard_argmax", "st_gumbel"}:
+            raise ValueError("w_execution must be one of: soft, hard_argmax, st_gumbel")
         valid_scalarizations = {"ws", "wp", "wpop", "ewc"}
         if self.role_scalarization not in valid_scalarizations:
             raise ValueError("role_scalarization must be one of: ws, wp, wpop, ewc")
@@ -836,6 +840,21 @@ class CTDERAMTrainer:
         # agent. Lower temperature -> closer to hard roles. Higher -> smoother.
         return F.softmax(q_values / max(self.soft_ram_temperature, 1e-6), dim=-1)
 
+    def _execution_weights(self, W: torch.Tensor, training: bool) -> torch.Tensor:
+        """Map selector weights to the weights actually executed by the env."""
+        if self.w_execution == "soft":
+            return W
+        if self.w_execution == "hard_argmax" or not training:
+            return F.one_hot(W.argmax(dim=-1), num_classes=self.K).to(W.dtype)
+        # In this off-policy DQN backup, the straight-through gradient benefit is partial.
+        logits = torch.log(W.clamp_min(1e-8))
+        return F.gumbel_softmax(
+            logits,
+            tau=max(self.soft_ram_temperature, 1e-6),
+            hard=True,
+            dim=-1,
+        )
+
     def _env_uses_expert_nu(self, env) -> bool:
         """True when env.step expects W/nu instead of movement actions."""
         return getattr(env, "ctde_action_mode", "movement_actions") == "role_weights"
@@ -1031,11 +1050,18 @@ class CTDERAMTrainer:
         z_all = self._encode_all(obs_all).detach()
         extra = self._build_extra(env, r_accum, prev_W, scal_weights)
         roles, W = self.select_roles(z_all, extra, epsilon_ram)
+        executed_W = self._execution_weights(W, training=True)
         role_counts = np.zeros(self.K, dtype=np.float64)
         W_sum = np.zeros(self.K, dtype=np.float64)
+        executed_role_counts = np.zeros(self.K, dtype=np.float64)
+        executed_W_sum = np.zeros(self.K, dtype=np.float64)
         n_role_decisions = 0
         role_counts += np.bincount(_tensor_to_numpy(W.argmax(dim=-1), dtype=np.int64), minlength=self.K)
         W_sum += _tensor_to_numpy(W, dtype=np.float32).mean(axis=0)
+        executed_role_counts += np.bincount(
+            _tensor_to_numpy(executed_W.argmax(dim=-1), dtype=np.int64), minlength=self.K
+        )
+        executed_W_sum += _tensor_to_numpy(executed_W, dtype=np.float32).mean(axis=0)
         n_role_decisions += 1
         z_all_prev, extra_prev = z_all, extra
 
@@ -1050,7 +1076,7 @@ class CTDERAMTrainer:
 
         while not done:
             obs_next, r_vecs, done, info, actions = self._step_env_with_current_W(
-                env, obs_all, W, epsilon_low
+                env, obs_all, executed_W, epsilon_low
             )
             reward_mat = self._stack_rewards(r_vecs)
             curr_metrics = {
@@ -1117,12 +1143,18 @@ class CTDERAMTrainer:
                     m["global_agg_grad_abs_sums"].append(float(self.last_global_agg_grad_abs_sum or 0.0))
 
                 new_roles, new_W = self.select_roles(z_next, extra_next, epsilon_ram)
-                if not torch.equal(new_W, W):
+                new_executed_W = self._execution_weights(new_W, training=True)
+                if not torch.equal(new_executed_W, executed_W):
                     m["n_switches"] += 1
                 z_all_prev, extra_prev = z_next, extra_next
                 roles, W, prev_W = new_roles, new_W, new_W
+                executed_W = new_executed_W
                 role_counts += np.bincount(_tensor_to_numpy(W.argmax(dim=-1), dtype=np.int64), minlength=self.K)
                 W_sum += _tensor_to_numpy(W, dtype=np.float32).mean(axis=0)
+                executed_role_counts += np.bincount(
+                    _tensor_to_numpy(executed_W.argmax(dim=-1), dtype=np.int64), minlength=self.K
+                )
+                executed_W_sum += _tensor_to_numpy(executed_W, dtype=np.float32).mean(axis=0)
                 n_role_decisions += 1
                 window_start_metrics = curr_metrics
                 R_role = 0.0
@@ -1130,6 +1162,8 @@ class CTDERAMTrainer:
 
         role_frac = role_counts / max(float(role_counts.sum()), 1.0)
         mean_W = W_sum / max(float(n_role_decisions), 1.0)
+        executed_role_frac = executed_role_counts / max(float(executed_role_counts.sum()), 1.0)
+        mean_executed_W = executed_W_sum / max(float(n_role_decisions), 1.0)
         m.update({
             "n_steps": ep_step,
             "epsilon_low": float(epsilon_low),
@@ -1145,6 +1179,8 @@ class CTDERAMTrainer:
         for k in range(self.K):
             m[f"role{k}_frac"] = float(role_frac[k])
             m[f"role{k}_mean_W"] = float(mean_W[k])
+            m[f"executed_role{k}_frac"] = float(executed_role_frac[k])
+            m[f"executed_role{k}_mean_W"] = float(mean_executed_W[k])
         if self.K == 2:
             m["mean_nu_role1"] = float(role_frac[1])
         self.tb.log_episode_metrics(m, prefix="train")
@@ -1174,11 +1210,12 @@ class CTDERAMTrainer:
             z_all = self._encode_all(obs_all).detach()
             extra = self._build_extra(env, r_accum, prev_W, scal_weights)
             _, W = self.select_roles(z_all, extra, epsilon_ram=0.0)
+            executed_W = self._execution_weights(W, training=False)
             metrics = dict(coverage=0.0, trash_cleaned=0.0, n_switches=0)
             info = {}
             while not done:
                 obs_all, r_vecs, done, info, _ = self._step_env_with_current_W(
-                    env, obs_all, W, epsilon_low=0.0
+                    env, obs_all, executed_W, epsilon_low=0.0
                 )
                 r_accum += self._stack_rewards(r_vecs).sum(dim=0)
                 ep_step += 1
@@ -1186,10 +1223,12 @@ class CTDERAMTrainer:
                     z_next = self._encode_all(obs_all).detach()
                     extra = self._build_extra(env, r_accum, W, scal_weights)
                     _, new_W = self.select_roles(z_next, extra, epsilon_ram=0.0)
-                    if not torch.equal(new_W, W):
+                    new_executed_W = self._execution_weights(new_W, training=False)
+                    if not torch.equal(new_executed_W, executed_W):
                         metrics["n_switches"] += 1
                     W = new_W
-                    for k in _tensor_to_numpy(W.argmax(dim=-1), dtype=np.int64):
+                    executed_W = new_executed_W
+                    for k in _tensor_to_numpy(executed_W.argmax(dim=-1), dtype=np.int64):
                         role_counts[k] += 1
                     r_accum = torch.zeros(self.K, device=self.device)
             metrics["coverage"] = self._env_value(env, "coverage_pct", 0.0)
@@ -1302,12 +1341,13 @@ class CTDERAMTrainer:
                 z_all = self._encode_all(obs_all).detach()
                 extra = self._build_extra(env, r_accum, prev_W, scal_weights)
                 _, W = self.select_roles(z_all, extra, epsilon_ram=0.0)
-                W_records.append(_tensor_to_numpy(W, dtype=np.float32))
-                role_records.append(_tensor_to_numpy(W.argmax(dim=-1), dtype=np.int64))
+                executed_W = self._execution_weights(W, training=False)
+                W_records.append(_tensor_to_numpy(executed_W, dtype=np.float32))
+                role_records.append(_tensor_to_numpy(executed_W.argmax(dim=-1), dtype=np.int64))
 
                 while not done:
                     obs_all, r_vecs, done, info, _ = self._step_env_with_current_W(
-                        env, obs_all, W, epsilon_low=0.0
+                        env, obs_all, executed_W, epsilon_low=0.0
                     )
                     r_accum += self._stack_rewards(r_vecs).sum(dim=0)
                     ep_step += 1
@@ -1316,8 +1356,9 @@ class CTDERAMTrainer:
                         z_next = self._encode_all(obs_all).detach()
                         extra = self._build_extra(env, r_accum, W, scal_weights)
                         _, W = self.select_roles(z_next, extra, epsilon_ram=0.0)
-                        W_records.append(_tensor_to_numpy(W, dtype=np.float32))
-                        role_records.append(_tensor_to_numpy(W.argmax(dim=-1), dtype=np.int64))
+                        executed_W = self._execution_weights(W, training=False)
+                        W_records.append(_tensor_to_numpy(executed_W, dtype=np.float32))
+                        role_records.append(_tensor_to_numpy(executed_W.argmax(dim=-1), dtype=np.int64))
                         r_accum = torch.zeros(self.K, device=self.device)
 
                 coverages.append(self._env_value(env, "coverage_pct", 0.0))
@@ -1552,6 +1593,7 @@ class CTDERAMTrainer:
                 "ram_mode": self.ram_mode,
                 "soft_ram_arch": self.soft_ram_arch,
                 "soft_ram_temperature": self.soft_ram_temperature,
+                "w_execution": self.w_execution,
                 "role_state_mode": self.role_state_mode,
                 "role_reward_norm": self.role_reward_norm_name,
                 "role_scalarization": self.role_scalarization,

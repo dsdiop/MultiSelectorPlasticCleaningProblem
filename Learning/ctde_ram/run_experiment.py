@@ -167,6 +167,12 @@ def parse_args(argv=None):
         help="Only for --ram-mode soft_v2: lower values make W closer to hard one-hot roles.",
     )
     p.add_argument(
+        "--w-execution",
+        choices=["soft", "hard_argmax", "st_gumbel"],
+        default="soft",
+        help="How selector weights are hardened before execution; T-role still controls cadence.",
+    )
+    p.add_argument(
         "--role-state-mode",
         choices=["auto", "flat", "pooled"],
         default="auto",
@@ -388,6 +394,7 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         global_agg_mode=args.global_agg,
         soft_ram_arch=args.soft_ram_arch,
         soft_ram_temperature=args.soft_ram_temperature,
+        w_execution=args.w_execution,
         role_state_mode=args.role_state_mode,
         normalize_role_rewards=not args.no_reward_normalization,
         role_reward_norm=args.role_reward_norm,
