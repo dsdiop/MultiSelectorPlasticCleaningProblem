@@ -226,6 +226,9 @@ class CTDERAMTrainer:
         soft_ram_temperature: float = 1.0,
         w_execution: str = "soft",
         role_switch_penalty: float = 0.0,
+        hpr: bool = False,
+        hpr_fraction: float = 0.5,
+        hpr_kappa: float = 1.0,
         # role_state_mode controls the mission/context vector appended to g.
         #
         #   flat   -> previous W is flattened; matches the original toy implementation,
@@ -283,6 +286,13 @@ class CTDERAMTrainer:
         self.role_switch_penalty = float(role_switch_penalty)
         if self.role_switch_penalty < 0.0:
             raise ValueError("role_switch_penalty must be non-negative")
+        self.hpr = bool(hpr)
+        self.hpr_fraction = float(hpr_fraction)
+        self.hpr_kappa = float(hpr_kappa)
+        if not 0.0 <= self.hpr_fraction <= 1.0:
+            raise ValueError("hpr_fraction must be in [0, 1]")
+        if self.hpr_kappa <= 0.0:
+            raise ValueError("hpr_kappa must be positive")
         self.role_scalarization = role_scalarization.lower()
         self.q_scalarization = q_scalarization.lower()
         self.scalarization_power = float(scalarization_power)
@@ -370,7 +380,7 @@ class CTDERAMTrainer:
         self.ram_q_tgt = copy.deepcopy(self.ram_q).eval()
 
         self.bufs_low = [LowLevelReplayBuffer(buf_low_cap, self.obs_shape) for _ in range(self.K)]
-        self.buf_role = RoleReplayBuffer(buf_role_cap, self.N, self.d_enc, self.d_extra)
+        self.buf_role = RoleReplayBuffer(buf_role_cap, self.N, self.d_enc, self.d_extra, self.K)
 
         if not self.freeze_low_level:
             low_params = [p for p in self._low_level_parameters() if p.requires_grad]
@@ -987,12 +997,29 @@ class CTDERAMTrainer:
             return None
         if self.buf_role.size < self.batch_role:
             return None
-        z, extra, W_action, R, zn, en, d = self.buf_role.sample(self.batch_role)
+        z, extra, W_action, R, r_components, zn, en, d = self.buf_role.sample(self.batch_role)
         z, extra = z.to(self.device), extra.to(self.device)
         zn, en = zn.to(self.device), en.to(self.device)
         W_action = W_action.to(self.device)
         roles = W_action.argmax(dim=-1).long()
         R, d = R.to(self.device), d.to(self.device)
+        r_components = r_components.to(self.device)
+
+        if self.hpr and self.hpr_fraction > 0.0:
+            relabel_count = min(self.batch_role, int(round(self.batch_role * self.hpr_fraction)))
+            if relabel_count > 0:
+                relabel_idx = torch.randperm(self.batch_role, device=self.device)[:relabel_count]
+                w_orig = extra[relabel_idx, -self.K:]
+                concentration = self.hpr_kappa * w_orig.clamp_min(0.0) + 1e-6
+                w_relabel = torch.distributions.Dirichlet(concentration).sample()
+                extra = extra.clone()
+                en = en.clone()
+                R = R.clone()
+                extra[relabel_idx, -self.K:] = w_relabel
+                en[relabel_idx, -self.K:] = w_relabel
+                R[relabel_idx] = self._scalarize_role_reward(
+                    r_components[relabel_idx], w_relabel, update_norm=False
+                )
 
         g = self.global_agg(z)
         role_state = torch.cat([g, extra], dim=-1)
@@ -1064,6 +1091,7 @@ class CTDERAMTrainer:
             "coverage": self._env_value(env, "coverage_pct", 0.0),
         }
         r_accum = torch.zeros(self.K, device=self.device)
+        window_r_components = torch.zeros(self.K, device=self.device)
         prev_W = torch.zeros(self.N, self.K, device=self.device)
 
         z_all = self._encode_all(obs_all).detach()
@@ -1126,6 +1154,7 @@ class CTDERAMTrainer:
             if self.ram_reward_mode == "delta_metrics":
                 r_accum += fleet_r
             else:
+                window_r_components += fleet_r
                 R_step = float(self._scalarize_role_reward(fleet_r, sw_t, update_norm=True).item())
                 R_role += R_step
                 m["total_reward"] += R_step
@@ -1142,6 +1171,7 @@ class CTDERAMTrainer:
             if (ep_step % self.T_role == 0) or done:
                 if self.ram_reward_mode == "delta_metrics":
                     fleet_r = r_accum
+                    window_r_components = r_accum.clone()
                     R_step = float(self._scalarize_role_reward(fleet_r, sw_t, update_norm=True).item())
                     R_role = R_step
                     m["total_reward"] += R_step
@@ -1156,6 +1186,7 @@ class CTDERAMTrainer:
                     _tensor_to_numpy(z_next, dtype=np.float32),
                     _tensor_to_numpy(extra_next, dtype=np.float32),
                     done,
+                    r_components=_tensor_to_numpy(window_r_components, dtype=np.float32),
                 )
 
                 lr = self.update_ram()
@@ -1186,6 +1217,7 @@ class CTDERAMTrainer:
                 window_start_metrics = curr_metrics
                 R_role = 0.0
                 r_accum = torch.zeros(self.K, device=self.device)
+                window_r_components = torch.zeros(self.K, device=self.device)
 
         role_frac = role_counts / max(float(role_counts.sum()), 1.0)
         mean_W = W_sum / max(float(n_role_decisions), 1.0)
@@ -1624,6 +1656,9 @@ class CTDERAMTrainer:
                 "soft_ram_temperature": self.soft_ram_temperature,
                 "w_execution": self.w_execution,
                 "role_switch_penalty": self.role_switch_penalty,
+                "hpr": self.hpr,
+                "hpr_fraction": self.hpr_fraction,
+                "hpr_kappa": self.hpr_kappa,
                 "role_state_mode": self.role_state_mode,
                 "role_reward_norm": self.role_reward_norm_name,
                 "role_scalarization": self.role_scalarization,
@@ -1655,6 +1690,9 @@ class CTDERAMTrainer:
                 "popart": self._popart_state(),
                 "role_reward": self._role_reward_norm_state(),
             },
+            "replay_buffers": {
+                "role": self.buf_role.state_dict(),
+            },
             "optimizers": optim_state,
         }
 
@@ -1674,6 +1712,7 @@ class CTDERAMTrainer:
         self._load_low_level_state(models.get("low_level"))
         self._load_popart_state(ckpt.get("normalizers", {}).get("popart"))
         self._load_role_reward_norm_state(ckpt.get("normalizers", {}).get("role_reward"))
+        self.buf_role.load_state_dict(ckpt.get("replay_buffers", {}).get("role"))
 
         steps = ckpt.get("steps", {})
         self.step_count_low = int(steps.get("low", self.step_count_low))

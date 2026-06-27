@@ -178,6 +178,9 @@ def parse_args(argv=None):
         default=0.0,
         help="Penalty applied only to RAM learning reward when the selected role changes.",
     )
+    p.add_argument("--hpr", action="store_true", help="Enable hindsight preference replay.")
+    p.add_argument("--hpr-fraction", type=float, default=0.5, help="Fraction of each RAM batch to relabel.")
+    p.add_argument("--hpr-kappa", type=float, default=1.0, help="Dirichlet concentration scale for HPR.")
     p.add_argument(
         "--role-state-mode",
         choices=["auto", "flat", "pooled"],
@@ -402,6 +405,9 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         soft_ram_temperature=args.soft_ram_temperature,
         w_execution=args.w_execution,
         role_switch_penalty=args.role_switch_penalty,
+        hpr=args.hpr,
+        hpr_fraction=args.hpr_fraction,
+        hpr_kappa=args.hpr_kappa,
         role_state_mode=args.role_state_mode,
         normalize_role_rewards=not args.no_reward_normalization,
         role_reward_norm=args.role_reward_norm,
