@@ -182,6 +182,10 @@ def parse_args(argv=None):
     p.add_argument("--hpr-fraction", type=float, default=0.5, help="Fraction of each RAM batch to relabel.")
     p.add_argument("--hpr-kappa", type=float, default=1.0, help="Dirichlet concentration scale for HPR.")
     p.add_argument(
+        "--w-conditioning", choices=["concat", "film"], default="concat",
+        help="Preference conditioning for the RAM role network.",
+    )
+    p.add_argument(
         "--role-state-mode",
         choices=["auto", "flat", "pooled"],
         default="auto",
@@ -408,6 +412,7 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         hpr=args.hpr,
         hpr_fraction=args.hpr_fraction,
         hpr_kappa=args.hpr_kappa,
+        w_conditioning=args.w_conditioning,
         role_state_mode=args.role_state_mode,
         normalize_role_rewards=not args.no_reward_normalization,
         role_reward_norm=args.role_reward_norm,

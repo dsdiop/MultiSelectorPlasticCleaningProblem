@@ -19,14 +19,38 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class FiLMConditioner(nn.Module):
+    def __init__(self, preference_dim: int, feature_dim: int):
+        super().__init__()
+        self.feature_dim = int(feature_dim)
+        self.net = nn.Sequential(
+            nn.Linear(preference_dim, 32), nn.ReLU(),
+            nn.Linear(32, 32), nn.ReLU(),
+            nn.Linear(32, 2 * feature_dim),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+        with torch.no_grad():
+            self.net[-1].bias[:feature_dim].fill_(1.0)
+
+    def forward(self, preference):
+        gamma, beta = self.net(preference).split(self.feature_dim, dim=-1)
+        return gamma, beta
+
+
 class RoleSelectorAttention(nn.Module):
-    def __init__(self, d_enc=128, d_ctx=256, K=2, d_role=64, d_extra=0):
+    def __init__(
+        self, d_enc=128, d_ctx=256, K=2, d_role=64, d_extra=0,
+        w_conditioning="concat",
+    ):
         super().__init__()
         self.K = K
         self.scale = 1.0 / math.sqrt(d_role)
         self.role_keys = nn.Parameter(torch.randn(K, d_role) * self.scale)
         self.d_extra = int(d_extra)
         self.query_proj = nn.Linear(d_enc + d_ctx + self.d_extra, d_role)
+        self.w_conditioning = w_conditioning
+        self.film = FiLMConditioner(K, d_role) if w_conditioning == "film" else None
 
     def logits(self, z_all, g, extra=None):
         # z_all: (B, N, d_enc)
@@ -43,6 +67,9 @@ class RoleSelectorAttention(nn.Module):
             parts.append(extra_tiled)
         x = torch.cat(parts, dim=-1)
         q = self.query_proj(x)
+        if self.film is not None:
+            gamma, beta = self.film(extra[:, -self.K:])
+            q = gamma.unsqueeze(1) * q + beta.unsqueeze(1)
         return q @ self.role_keys.T * self.scale
 
     def forward(self, z_all, g, extra=None, temperature=1.0):

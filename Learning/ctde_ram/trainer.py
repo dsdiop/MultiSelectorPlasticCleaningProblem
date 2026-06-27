@@ -44,7 +44,7 @@ try:
     from .popart import PopArtNorm
     from .replay_buffers import LowLevelReplayBuffer, RoleReplayBuffer
     from .global_aggregator import GlobalAggregator
-    from .role_selector import RoleSelectorAttention
+    from .role_selector import FiLMConditioner, RoleSelectorAttention
     from .pareto import sweep_scalarizations
     from .tb_logger import TBLogger
 except ImportError:
@@ -59,7 +59,7 @@ except ImportError:
     from popart import PopArtNorm
     from replay_buffers import LowLevelReplayBuffer, RoleReplayBuffer
     from global_aggregator import GlobalAggregator
-    from role_selector import RoleSelectorAttention
+    from role_selector import FiLMConditioner, RoleSelectorAttention
     from pareto import sweep_scalarizations
     from tb_logger import TBLogger
 
@@ -229,6 +229,7 @@ class CTDERAMTrainer:
         hpr: bool = False,
         hpr_fraction: float = 0.5,
         hpr_kappa: float = 1.0,
+        w_conditioning: str = "concat",
         # role_state_mode controls the mission/context vector appended to g.
         #
         #   flat   -> previous W is flattened; matches the original toy implementation,
@@ -293,6 +294,9 @@ class CTDERAMTrainer:
             raise ValueError("hpr_fraction must be in [0, 1]")
         if self.hpr_kappa <= 0.0:
             raise ValueError("hpr_kappa must be positive")
+        self.w_conditioning = w_conditioning
+        if self.w_conditioning not in {"concat", "film"}:
+            raise ValueError("w_conditioning must be one of: concat, film")
         self.role_scalarization = role_scalarization.lower()
         self.q_scalarization = q_scalarization.lower()
         self.scalarization_power = float(scalarization_power)
@@ -368,7 +372,8 @@ class CTDERAMTrainer:
 
         self.global_agg = GlobalAggregator(self.d_enc, d_ctx, mode=self.global_agg_mode).to(self.device)
         self.role_selector = RoleSelectorAttention(
-            self.d_enc, d_ctx, self.K, d_role, d_extra=self.d_extra
+            self.d_enc, d_ctx, self.K, d_role, d_extra=self.d_extra,
+            w_conditioning=self.w_conditioning,
         ).to(self.device)
         self.role_selector_tgt = copy.deepcopy(self.role_selector).eval()
         ram_out = self.n_ram_actions if self.ram_mode == "discrete" else self.N * self.K
@@ -378,6 +383,11 @@ class CTDERAMTrainer:
             nn.Linear(256, ram_out),
         ).to(self.device)
         self.ram_q_tgt = copy.deepcopy(self.ram_q).eval()
+        self.ram_film = (
+            FiLMConditioner(self.K, 256).to(self.device)
+            if self.w_conditioning == "film" else None
+        )
+        self.ram_film_tgt = copy.deepcopy(self.ram_film).eval() if self.ram_film is not None else None
 
         self.bufs_low = [LowLevelReplayBuffer(buf_low_cap, self.obs_shape) for _ in range(self.K)]
         self.buf_role = RoleReplayBuffer(buf_role_cap, self.N, self.d_enc, self.d_extra, self.K)
@@ -504,6 +514,8 @@ class CTDERAMTrainer:
             params += list(self.role_selector.parameters())
         else:
             params += list(self.ram_q.parameters())
+            if self.ram_film is not None:
+                params += list(self.ram_film.parameters())
         return params
 
     def _sync_ram_target(self) -> None:
@@ -513,6 +525,8 @@ class CTDERAMTrainer:
             self.role_selector_tgt.load_state_dict(self.role_selector.state_dict())
         else:
             self.ram_q_tgt.load_state_dict(self.ram_q.state_dict())
+            if self.ram_film is not None:
+                self.ram_film_tgt.load_state_dict(self.ram_film.state_dict())
 
     def _sync_low_target(self) -> None:
         if self.low_level_backend == "mlp":
@@ -846,8 +860,19 @@ class CTDERAMTrainer:
 
         g = self.global_agg(z_batch)
         role_state = torch.cat([g, extra_batch], dim=-1)
+        return self._ram_q_values(role_state, target=target).view(-1, self.N, self.K)
+
+    def _ram_q_values(self, role_state: torch.Tensor, target: bool = False) -> torch.Tensor:
         q_net = self.ram_q_tgt if target else self.ram_q
-        return q_net(role_state).view(-1, self.N, self.K)
+        film = self.ram_film_tgt if target else self.ram_film
+        if film is None:
+            return q_net(role_state)
+        h = q_net[1](q_net[0](role_state))
+        gamma, beta = film(role_state[:, -self.K:])
+        h = gamma * h + beta
+        for layer in q_net[2:]:
+            h = layer(h)
+        return h
 
     def _soft_weights_from_q(self, q_values: torch.Tensor) -> torch.Tensor:
         # Elicit V2 execution: W is a softmax role/preference distribution per
@@ -926,7 +951,7 @@ class CTDERAMTrainer:
             if self.rng.random() < epsilon_ram:
                 combo_idx = int(self.rng.integers(0, self.n_ram_actions))
             else:
-                combo_idx = int(self.ram_q(role_state.unsqueeze(0)).squeeze(0).argmax().item())
+                combo_idx = int(self._ram_q_values(role_state.unsqueeze(0)).squeeze(0).argmax().item())
             roles = np.asarray(self.ROLE_COMBOS[combo_idx], dtype=np.int64)
             return roles, self._roles_to_W(roles)
 
@@ -950,7 +975,7 @@ class CTDERAMTrainer:
         if self.rng.random() < epsilon_ram:
             roles = self.rng.integers(0, self.K, size=self.N, dtype=np.int64)
         else:
-            q = self.ram_q(role_state.unsqueeze(0)).view(self.N, self.K)
+            q = self._ram_q_values(role_state.unsqueeze(0)).view(self.N, self.K)
             roles = _tensor_to_numpy(q.argmax(dim=-1), dtype=np.int64)
         return roles, self._roles_to_W(roles)
 
@@ -1028,9 +1053,9 @@ class CTDERAMTrainer:
             g_next = self.global_agg(zn)
             rs_next = torch.cat([g_next, en], dim=-1)
             if self.ram_mode == "discrete":
-                q_next_online = self.ram_q(rs_next)
+                q_next_online = self._ram_q_values(rs_next)
                 best = q_next_online.argmax(dim=1)
-                q_next_tgt = self.ram_q_tgt(rs_next)
+                q_next_tgt = self._ram_q_values(rs_next, target=True)
                 q_next_sel = q_next_tgt.gather(1, best.unsqueeze(1)).squeeze(1)
             elif self.ram_mode == "soft_v2":
                 # Soft Double-DQN-style backup:
@@ -1043,20 +1068,20 @@ class CTDERAMTrainer:
                 q_next_tgt = self._soft_role_q_values(zn, en, target=True)
                 q_next_sel = (W_next * q_next_tgt).sum(dim=(1, 2))
             else:
-                q_next_online = self.ram_q(rs_next).view(-1, self.N, self.K)
+                q_next_online = self._ram_q_values(rs_next).view(-1, self.N, self.K)
                 best_roles = q_next_online.argmax(dim=-1, keepdim=True)
-                q_next_tgt = self.ram_q_tgt(rs_next).view(-1, self.N, self.K)
+                q_next_tgt = self._ram_q_values(rs_next, target=True).view(-1, self.N, self.K)
                 q_next_sel = q_next_tgt.gather(2, best_roles).squeeze(-1).sum(dim=1)
             target = R + self.gamma_role * q_next_sel * (1.0 - d)
 
         if self.ram_mode == "discrete":
             action_idx = self._roles_to_combo_idx(roles)
-            q_pred = self.ram_q(role_state).gather(1, action_idx.unsqueeze(1)).squeeze(1)
+            q_pred = self._ram_q_values(role_state).gather(1, action_idx.unsqueeze(1)).squeeze(1)
         elif self.ram_mode == "soft_v2":
             q_roles = self._soft_role_q_values(z, extra, target=False)
             q_pred = (W_action * q_roles).sum(dim=(1, 2))
         else:
-            q_roles = self.ram_q(role_state).view(-1, self.N, self.K)
+            q_roles = self._ram_q_values(role_state).view(-1, self.N, self.K)
             q_pred = q_roles.gather(2, roles.unsqueeze(-1)).squeeze(-1).sum(dim=1)
 
         loss = F.smooth_l1_loss(q_pred, target)
@@ -1659,6 +1684,7 @@ class CTDERAMTrainer:
                 "hpr": self.hpr,
                 "hpr_fraction": self.hpr_fraction,
                 "hpr_kappa": self.hpr_kappa,
+                "w_conditioning": self.w_conditioning,
                 "role_state_mode": self.role_state_mode,
                 "role_reward_norm": self.role_reward_norm_name,
                 "role_scalarization": self.role_scalarization,
@@ -1684,6 +1710,8 @@ class CTDERAMTrainer:
                 "role_selector_tgt": self.role_selector_tgt.state_dict(),
                 "ram_q": self.ram_q.state_dict(),
                 "ram_q_tgt": self.ram_q_tgt.state_dict(),
+                "ram_film": None if self.ram_film is None else self.ram_film.state_dict(),
+                "ram_film_tgt": None if self.ram_film_tgt is None else self.ram_film_tgt.state_dict(),
                 "low_level": self._low_level_state(),
             },
             "normalizers": {
@@ -1709,6 +1737,9 @@ class CTDERAMTrainer:
         self.role_selector_tgt.load_state_dict(models.get("role_selector_tgt", models["role_selector"]))
         self.ram_q.load_state_dict(models["ram_q"])
         self.ram_q_tgt.load_state_dict(models.get("ram_q_tgt", models["ram_q"]))
+        if self.ram_film is not None and models.get("ram_film") is not None:
+            self.ram_film.load_state_dict(models["ram_film"])
+            self.ram_film_tgt.load_state_dict(models.get("ram_film_tgt", models["ram_film"]))
         self._load_low_level_state(models.get("low_level"))
         self._load_popart_state(ckpt.get("normalizers", {}).get("popart"))
         self._load_role_reward_norm_state(ckpt.get("normalizers", {}).get("role_reward"))
