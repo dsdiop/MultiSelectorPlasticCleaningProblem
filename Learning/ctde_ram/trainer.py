@@ -45,7 +45,8 @@ try:
     from .replay_buffers import LowLevelReplayBuffer, RoleReplayBuffer
     from .global_aggregator import GlobalAggregator, MonotonicQMixer
     from .role_selector import DuelingRAMHead, FiLMConditioner, RoleSelectorAttention
-    from .pareto import sweep_scalarizations
+    from .pareto import hypervolume, pareto_front, sweep_scalarizations
+    from .experiment_io import plot_pareto
     from .tb_logger import TBLogger
 except ImportError:
     from nets import (
@@ -60,7 +61,8 @@ except ImportError:
     from replay_buffers import LowLevelReplayBuffer, RoleReplayBuffer
     from global_aggregator import GlobalAggregator, MonotonicQMixer
     from role_selector import DuelingRAMHead, FiLMConditioner, RoleSelectorAttention
-    from pareto import sweep_scalarizations
+    from pareto import hypervolume, pareto_front, sweep_scalarizations
+    from experiment_io import plot_pareto
     from tb_logger import TBLogger
 
 
@@ -1422,6 +1424,7 @@ class CTDERAMTrainer:
         n_episodes_per_w: int = 3,
         save_csv: Optional[str] = None,
         plot_path: Optional[str] = None,
+        pareto_plot_path: Optional[str] = None,
     ):
         """Sweep preference weights and report whether the selected roles move.
 
@@ -1559,6 +1562,27 @@ class CTDERAMTrainer:
                 _progress_write(f"[probe] wrote plot: {plot_path}")
             except Exception as ex:
                 _progress_write(f"[probe] plot skipped: {ex!r}")
+
+        if pareto_plot_path:
+            points = np.asarray(
+                [[row["coverage"], row["trash_cleaned"]] for row in rows],
+                dtype=np.float64,
+            )
+            front = pareto_front(points)
+            pareto_result = {
+                "all_points": points,
+                "pareto_front": front,
+                "hypervolume": hypervolume(front, np.zeros(2, dtype=np.float64)),
+                "per_weight": [
+                    ((row["w0"], row["w1"]), row)
+                    for row in rows
+                ],
+                "ref_point": np.zeros(2, dtype=np.float64),
+            }
+            if plot_pareto(pareto_result, pareto_plot_path):
+                _progress_write(f"[probe] wrote Pareto plot: {pareto_plot_path}")
+            else:
+                _progress_write("[probe] Pareto plot skipped")
 
         return rows
 

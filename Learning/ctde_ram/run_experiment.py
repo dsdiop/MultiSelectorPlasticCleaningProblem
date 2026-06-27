@@ -264,6 +264,12 @@ def parse_args(argv=None):
     p.add_argument("--probe-csv", type=str, default=None, help="Optional CSV path for the preference probe table.")
     p.add_argument("--probe-plot", type=str, default=None, help="Optional PNG path for the preference probe plot.")
     p.add_argument(
+        "--probe-pareto-plot",
+        type=str,
+        default=None,
+        help="Optional PNG path for the coverage-vs-cleaning Pareto front built from probe rollouts.",
+    )
+    p.add_argument(
         "--check-frozen-popart",
         action="store_true",
         help="Verify --freeze keeps raw low-level Q-values unchanged during PopArt stat updates.",
@@ -449,6 +455,8 @@ def main():
         args.probe_csv = build_probe_artifact_path(run_dir, args.run_name, args.episodes, "csv")
     if not args.probe_plot:
         args.probe_plot = build_probe_artifact_path(run_dir, args.run_name, args.episodes, "png")
+    if not args.probe_pareto_plot:
+        args.probe_pareto_plot = build_probe_artifact_path(run_dir, args.run_name, args.episodes, "pareto.png")
     metrics_dir = ensure_dir(os.path.join(run_dir, "metrics"))
     eval_dir = ensure_dir(os.path.join(run_dir, "eval"))
     ckpt_dir = ensure_dir(os.path.join(run_dir, "checkpoints"))
@@ -500,6 +508,44 @@ def main():
     eval_episodes = args.eval_episodes if args.eval_episodes is not None else (2 if args.smoke else 3)
     run_config = args_to_dict(args)
 
+    def run_eval(eval_episode: int):
+        nonlocal best_hv, latest_eval
+        if args.eval_points <= 1:
+            eval_points = [(1.0, 0.0)]
+        else:
+            eval_points = [
+                (float(1.0 - t), float(t))
+                for t in np.linspace(0.0, 1.0, args.eval_points)
+            ]
+        latest_eval = trainer.evaluate_pareto(
+            env,
+            scal_grid=[(1.0, 0.0), (0.5, 0.5), (0.0, 1.0)] if args.smoke
+            else eval_points,
+            n_episodes_per_w=eval_episodes,
+        )
+        prefix = f"eval_ep_{eval_episode:05d}"
+        paths = save_pareto_artifacts(latest_eval, eval_dir, prefix)
+        append_csv_row(os.path.join(metrics_dir, "eval_summary.csv"), {
+            "episode": eval_episode,
+            "hypervolume": float(latest_eval["hypervolume"]),
+            "front_size": int(latest_eval["pareto_front"].shape[0]),
+            "n_points": int(latest_eval["all_points"].shape[0]),
+            "json": paths["json"],
+            "csv": paths["csv"],
+            "png": paths["png"],
+        })
+        write_json(os.path.join(metrics_dir, "latest_eval.json"), latest_eval)
+        if float(latest_eval["hypervolume"]) > best_hv:
+            best_hv = float(latest_eval["hypervolume"])
+            best_path = os.path.join(ckpt_dir, "best_hv.pt")
+            trainer.save_checkpoint(
+                best_path,
+                run_config=run_config,
+                episode=eval_episode,
+                metrics={"best_hv": best_hv},
+            )
+            progress_write(f"[checkpoint] best_hv={best_hv:.4f} saved={best_path}")
+
     if trange is not None:
         episode_iter = trange(args.episodes, desc="train", unit="ep", dynamic_ncols=True)
     else:
@@ -537,33 +583,7 @@ def main():
         )
 
         if eval_every > 0 and ep % eval_every == 0:
-            if args.eval_points <= 1:
-                eval_points = [(1.0, 0.0)]
-            else:
-                eval_points = [(float(1.0 - t), float(t)) for t in np.linspace(0.0, 1.0, args.eval_points)]
-            latest_eval = trainer.evaluate_pareto(
-                env,
-                scal_grid=[(1.0, 0.0), (0.5, 0.5), (0.0, 1.0)] if args.smoke
-                else eval_points,
-                n_episodes_per_w=eval_episodes,
-            )
-            prefix = f"eval_ep_{ep:05d}"
-            paths = save_pareto_artifacts(latest_eval, eval_dir, prefix)
-            append_csv_row(os.path.join(metrics_dir, "eval_summary.csv"), {
-                "episode": ep,
-                "hypervolume": float(latest_eval["hypervolume"]),
-                "front_size": int(latest_eval["pareto_front"].shape[0]),
-                "n_points": int(latest_eval["all_points"].shape[0]),
-                "json": paths["json"],
-                "csv": paths["csv"],
-                "png": paths["png"],
-            })
-            write_json(os.path.join(metrics_dir, "latest_eval.json"), latest_eval)
-            if float(latest_eval["hypervolume"]) > best_hv:
-                best_hv = float(latest_eval["hypervolume"])
-                best_path = os.path.join(ckpt_dir, "best_hv.pt")
-                trainer.save_checkpoint(best_path, run_config=run_config, episode=ep, metrics={"best_hv": best_hv})
-                progress_write(f"[checkpoint] best_hv={best_hv:.4f} saved={best_path}")
+            run_eval(ep)
 
         if args.save_every > 0 and (ep + 1) % args.save_every == 0:
             periodic_path = os.path.join(ckpt_dir, f"episode_{ep + 1:05d}.pt")
@@ -571,6 +591,12 @@ def main():
             trainer.save_checkpoint(periodic_path, run_config=run_config, episode=ep, metrics=m)
             trainer.save_checkpoint(latest_path, run_config=run_config, episode=ep, metrics=m)
             progress_write(f"[checkpoint] saved={periodic_path}")
+
+    # Periodic evaluation uses zero-based training indices (0, 500, ...). Run
+    # one additional sweep after all updates so the fully trained policy always
+    # has an eval_ep_<episodes> artifact (for example eval_ep_05000).
+    if eval_every > 0:
+        run_eval(args.episodes)
 
     if args.check_aggregator_grad:
         grad = trainer.last_global_agg_grad_abs_sum
@@ -591,6 +617,7 @@ def main():
             n_episodes_per_w=args.probe_episodes,
             save_csv=args.probe_csv,
             plot_path=args.probe_plot,
+            pareto_plot_path=args.probe_pareto_plot,
         )
 
     final_path = os.path.join(ckpt_dir, "final.pt")

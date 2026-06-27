@@ -271,6 +271,7 @@ metrics/latest_train_episode.json   last episode metrics
 metrics/eval_summary.csv            one row per eval sweep
 metrics/latest_eval.json            last Pareto sweep
 eval/eval_ep_XXXXX.{json,csv,png}   Pareto details per evaluation point
+eval/eval_ep_<episodes>.{json,csv,png} guaranteed final-policy Pareto evaluation
 checkpoints/latest.pt               latest checkpoint
 checkpoints/final.pt                final checkpoint
 checkpoints/best_hv.pt              best hypervolume checkpoint
@@ -445,10 +446,11 @@ python Learning/ctde_ram/run_experiment.py \
   --soft-ram-arch attention \
   --probe-preference-sensitivity \
   --probe-csv Learning/ctde_ram/preference_probe.csv \
-  --probe-plot Learning/ctde_ram/preference_probe.png
+  --probe-plot Learning/ctde_ram/preference_probe.png \
+  --probe-pareto-plot Learning/ctde_ram/preference_probe.pareto.png
 ```
 
-This sweeps `w=(1,0)` to `w=(0,1)` and prints both hard `argmax` role fractions and mean executed soft `W`. If these values are flat, the RAM is not reacting to preferences.
+This sweeps `w=(1,0)` to `w=(0,1)`, prints both hard `argmax` role fractions and mean executed soft `W`, and plots the coverage-versus-cleaning Pareto front from the same probe rollouts. If the role values are flat, the RAM is not reacting to preferences.
 
 Aggregator gradient check:
 

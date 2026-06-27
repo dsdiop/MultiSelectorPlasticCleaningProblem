@@ -116,6 +116,7 @@ def main():
             n_episodes_per_w=eval_args.probe_episodes,
             save_csv=os.path.join(out_dir, "preference_probe.csv"),
             plot_path=os.path.join(out_dir, "preference_probe.png"),
+            pareto_plot_path=os.path.join(out_dir, "preference_probe.pareto.png"),
         )
 
     trainer.close()
