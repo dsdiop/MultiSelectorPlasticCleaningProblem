@@ -225,6 +225,7 @@ class CTDERAMTrainer:
         soft_ram_arch: str = "attention",
         soft_ram_temperature: float = 1.0,
         w_execution: str = "soft",
+        role_switch_penalty: float = 0.0,
         # role_state_mode controls the mission/context vector appended to g.
         #
         #   flat   -> previous W is flattened; matches the original toy implementation,
@@ -279,6 +280,9 @@ class CTDERAMTrainer:
         self.soft_ram_arch = soft_ram_arch
         self.soft_ram_temperature = float(soft_ram_temperature)
         self.w_execution = w_execution
+        self.role_switch_penalty = float(role_switch_penalty)
+        if self.role_switch_penalty < 0.0:
+            raise ValueError("role_switch_penalty must be non-negative")
         self.role_scalarization = role_scalarization.lower()
         self.q_scalarization = q_scalarization.lower()
         self.scalarization_power = float(scalarization_power)
@@ -855,6 +859,21 @@ class CTDERAMTrainer:
             dim=-1,
         )
 
+    def _role_switch_cost(
+        self,
+        new_W: torch.Tensor,
+        previous_W: torch.Tensor,
+        new_executed_W: torch.Tensor,
+        previous_executed_W: torch.Tensor,
+    ) -> float:
+        if self.role_switch_penalty == 0.0:
+            return 0.0
+        if self.ram_mode == "soft_v2" and self.w_execution == "soft":
+            distance = torch.norm(new_W - previous_W, p=1)
+        else:
+            distance = (new_executed_W.argmax(dim=-1) != previous_executed_W.argmax(dim=-1)).sum()
+        return self.role_switch_penalty * float(distance.item())
+
     def _env_uses_expert_nu(self, env) -> bool:
         """True when env.step expects W/nu instead of movement actions."""
         return getattr(env, "ctde_action_mode", "movement_actions") == "role_weights"
@@ -1051,6 +1070,7 @@ class CTDERAMTrainer:
         extra = self._build_extra(env, r_accum, prev_W, scal_weights)
         roles, W = self.select_roles(z_all, extra, epsilon_ram)
         executed_W = self._execution_weights(W, training=True)
+        window_switch_penalty = 0.0
         role_counts = np.zeros(self.K, dtype=np.float64)
         W_sum = np.zeros(self.K, dtype=np.float64)
         executed_role_counts = np.zeros(self.K, dtype=np.float64)
@@ -1072,6 +1092,7 @@ class CTDERAMTrainer:
             ram_grad_abs_sums=[],
             global_agg_grad_abs_sums=[],
             n_switches=0,
+            role_switch_penalties=[],
         )
 
         while not done:
@@ -1124,13 +1145,14 @@ class CTDERAMTrainer:
                     R_step = float(self._scalarize_role_reward(fleet_r, sw_t, update_norm=True).item())
                     R_role = R_step
                     m["total_reward"] += R_step
+                learning_R_role = R_role - window_switch_penalty
                 z_next = self._encode_all(obs_all).detach()
                 extra_next = self._build_extra(env, r_accum, W, scal_weights)
                 self.buf_role.store(
                     _tensor_to_numpy(z_all_prev, dtype=np.float32),
                     _tensor_to_numpy(extra_prev, dtype=np.float32),
                     _tensor_to_numpy(W, dtype=np.float32),
-                    R_role,
+                    learning_R_role,
                     _tensor_to_numpy(z_next, dtype=np.float32),
                     _tensor_to_numpy(extra_next, dtype=np.float32),
                     done,
@@ -1144,11 +1166,16 @@ class CTDERAMTrainer:
 
                 new_roles, new_W = self.select_roles(z_next, extra_next, epsilon_ram)
                 new_executed_W = self._execution_weights(new_W, training=True)
+                next_window_switch_penalty = self._role_switch_cost(
+                    new_W, W, new_executed_W, executed_W
+                )
+                m["role_switch_penalties"].append(next_window_switch_penalty)
                 if not torch.equal(new_executed_W, executed_W):
                     m["n_switches"] += 1
                 z_all_prev, extra_prev = z_next, extra_next
                 roles, W, prev_W = new_roles, new_W, new_W
                 executed_W = new_executed_W
+                window_switch_penalty = next_window_switch_penalty
                 role_counts += np.bincount(_tensor_to_numpy(W.argmax(dim=-1), dtype=np.int64), minlength=self.K)
                 W_sum += _tensor_to_numpy(W, dtype=np.float32).mean(axis=0)
                 executed_role_counts += np.bincount(
@@ -1175,6 +1202,8 @@ class CTDERAMTrainer:
             "buf_low_min_size": int(min(buf.size for buf in self.bufs_low)) if self.bufs_low else 0,
             "last_global_agg_grad_abs_sum": float(self.last_global_agg_grad_abs_sum or 0.0),
             "last_ram_grad_abs_sum": float(self.last_ram_grad_abs_sum or 0.0),
+            "mean_role_switch_penalty": float(np.mean(m["role_switch_penalties"]))
+            if m["role_switch_penalties"] else 0.0,
         })
         for k in range(self.K):
             m[f"role{k}_frac"] = float(role_frac[k])
@@ -1594,6 +1623,7 @@ class CTDERAMTrainer:
                 "soft_ram_arch": self.soft_ram_arch,
                 "soft_ram_temperature": self.soft_ram_temperature,
                 "w_execution": self.w_execution,
+                "role_switch_penalty": self.role_switch_penalty,
                 "role_state_mode": self.role_state_mode,
                 "role_reward_norm": self.role_reward_norm_name,
                 "role_scalarization": self.role_scalarization,

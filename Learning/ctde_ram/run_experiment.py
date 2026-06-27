@@ -173,6 +173,12 @@ def parse_args(argv=None):
         help="How selector weights are hardened before execution; T-role still controls cadence.",
     )
     p.add_argument(
+        "--role-switch-penalty",
+        type=float,
+        default=0.0,
+        help="Penalty applied only to RAM learning reward when the selected role changes.",
+    )
+    p.add_argument(
         "--role-state-mode",
         choices=["auto", "flat", "pooled"],
         default="auto",
@@ -395,6 +401,7 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         soft_ram_arch=args.soft_ram_arch,
         soft_ram_temperature=args.soft_ram_temperature,
         w_execution=args.w_execution,
+        role_switch_penalty=args.role_switch_penalty,
         role_state_mode=args.role_state_mode,
         normalize_role_rewards=not args.no_reward_normalization,
         role_reward_norm=args.role_reward_norm,
