@@ -187,6 +187,10 @@ def parse_args(argv=None):
     )
     p.add_argument("--ram-dueling", action="store_true", help="Use a dueling RAM head for discrete/factored modes.")
     p.add_argument(
+        "--hfactored-mixer", choices=["sum", "qmix"], default="sum",
+        help="How factored per-agent role values are combined for RAM learning.",
+    )
+    p.add_argument(
         "--role-state-mode",
         choices=["auto", "flat", "pooled"],
         default="auto",
@@ -415,6 +419,7 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         hpr_kappa=args.hpr_kappa,
         w_conditioning=args.w_conditioning,
         ram_dueling=args.ram_dueling,
+        hfactored_mixer=args.hfactored_mixer,
         role_state_mode=args.role_state_mode,
         normalize_role_rewards=not args.no_reward_normalization,
         role_reward_norm=args.role_reward_norm,

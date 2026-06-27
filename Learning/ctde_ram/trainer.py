@@ -43,7 +43,7 @@ try:
     )
     from .popart import PopArtNorm
     from .replay_buffers import LowLevelReplayBuffer, RoleReplayBuffer
-    from .global_aggregator import GlobalAggregator
+    from .global_aggregator import GlobalAggregator, MonotonicQMixer
     from .role_selector import DuelingRAMHead, FiLMConditioner, RoleSelectorAttention
     from .pareto import sweep_scalarizations
     from .tb_logger import TBLogger
@@ -58,7 +58,7 @@ except ImportError:
     )
     from popart import PopArtNorm
     from replay_buffers import LowLevelReplayBuffer, RoleReplayBuffer
-    from global_aggregator import GlobalAggregator
+    from global_aggregator import GlobalAggregator, MonotonicQMixer
     from role_selector import DuelingRAMHead, FiLMConditioner, RoleSelectorAttention
     from pareto import sweep_scalarizations
     from tb_logger import TBLogger
@@ -231,6 +231,7 @@ class CTDERAMTrainer:
         hpr_kappa: float = 1.0,
         w_conditioning: str = "concat",
         ram_dueling: bool = False,
+        hfactored_mixer: str = "sum",
         # role_state_mode controls the mission/context vector appended to g.
         #
         #   flat   -> previous W is flattened; matches the original toy implementation,
@@ -299,6 +300,9 @@ class CTDERAMTrainer:
         if self.w_conditioning not in {"concat", "film"}:
             raise ValueError("w_conditioning must be one of: concat, film")
         self.ram_dueling = bool(ram_dueling)
+        self.hfactored_mixer = hfactored_mixer
+        if self.hfactored_mixer not in {"sum", "qmix"}:
+            raise ValueError("hfactored_mixer must be one of: sum, qmix")
         self.role_scalarization = role_scalarization.lower()
         self.q_scalarization = q_scalarization.lower()
         self.scalarization_power = float(scalarization_power)
@@ -400,6 +404,13 @@ class CTDERAMTrainer:
             if self.w_conditioning == "film" else None
         )
         self.ram_film_tgt = copy.deepcopy(self.ram_film).eval() if self.ram_film is not None else None
+        self.ram_mixer = (
+            MonotonicQMixer(self.N, self.d_role_state).to(self.device)
+            if self.hfactored_mixer == "qmix" and self.ram_mode == "factored" else None
+        )
+        self.ram_mixer_tgt = copy.deepcopy(self.ram_mixer).eval() if self.ram_mixer is not None else None
+        if self.hfactored_mixer == "qmix" and self.ram_mode != "factored":
+            print("[warning] --hfactored-mixer qmix applies only to factored RAM; using the existing backup.")
 
         self.bufs_low = [LowLevelReplayBuffer(buf_low_cap, self.obs_shape) for _ in range(self.K)]
         self.buf_role = RoleReplayBuffer(buf_role_cap, self.N, self.d_enc, self.d_extra, self.K)
@@ -528,6 +539,8 @@ class CTDERAMTrainer:
             params += list(self.ram_q.parameters())
             if self.ram_film is not None:
                 params += list(self.ram_film.parameters())
+            if self.ram_mixer is not None:
+                params += list(self.ram_mixer.parameters())
         return params
 
     def _sync_ram_target(self) -> None:
@@ -539,6 +552,8 @@ class CTDERAMTrainer:
             self.ram_q_tgt.load_state_dict(self.ram_q.state_dict())
             if self.ram_film is not None:
                 self.ram_film_tgt.load_state_dict(self.ram_film.state_dict())
+            if self.ram_mixer is not None:
+                self.ram_mixer_tgt.load_state_dict(self.ram_mixer.state_dict())
 
     def _sync_low_target(self) -> None:
         if self.low_level_backend == "mlp":
@@ -1083,7 +1098,11 @@ class CTDERAMTrainer:
                 q_next_online = self._ram_q_values(rs_next).view(-1, self.N, self.K)
                 best_roles = q_next_online.argmax(dim=-1, keepdim=True)
                 q_next_tgt = self._ram_q_values(rs_next, target=True).view(-1, self.N, self.K)
-                q_next_sel = q_next_tgt.gather(2, best_roles).squeeze(-1).sum(dim=1)
+                selected_next = q_next_tgt.gather(2, best_roles).squeeze(-1)
+                q_next_sel = (
+                    self.ram_mixer_tgt(selected_next, rs_next)
+                    if self.ram_mixer_tgt is not None else selected_next.sum(dim=1)
+                )
             target = R + self.gamma_role * q_next_sel * (1.0 - d)
 
         if self.ram_mode == "discrete":
@@ -1094,7 +1113,11 @@ class CTDERAMTrainer:
             q_pred = (W_action * q_roles).sum(dim=(1, 2))
         else:
             q_roles = self._ram_q_values(role_state).view(-1, self.N, self.K)
-            q_pred = q_roles.gather(2, roles.unsqueeze(-1)).squeeze(-1).sum(dim=1)
+            selected_q = q_roles.gather(2, roles.unsqueeze(-1)).squeeze(-1)
+            q_pred = (
+                self.ram_mixer(selected_q, role_state)
+                if self.ram_mixer is not None else selected_q.sum(dim=1)
+            )
 
         loss = F.smooth_l1_loss(q_pred, target)
         self.optim_ram.zero_grad()
@@ -1698,6 +1721,7 @@ class CTDERAMTrainer:
                 "hpr_kappa": self.hpr_kappa,
                 "w_conditioning": self.w_conditioning,
                 "ram_dueling": self.ram_dueling,
+                "hfactored_mixer": self.hfactored_mixer,
                 "role_state_mode": self.role_state_mode,
                 "role_reward_norm": self.role_reward_norm_name,
                 "role_scalarization": self.role_scalarization,
@@ -1725,6 +1749,8 @@ class CTDERAMTrainer:
                 "ram_q_tgt": self.ram_q_tgt.state_dict(),
                 "ram_film": None if self.ram_film is None else self.ram_film.state_dict(),
                 "ram_film_tgt": None if self.ram_film_tgt is None else self.ram_film_tgt.state_dict(),
+                "ram_mixer": None if self.ram_mixer is None else self.ram_mixer.state_dict(),
+                "ram_mixer_tgt": None if self.ram_mixer_tgt is None else self.ram_mixer_tgt.state_dict(),
                 "low_level": self._low_level_state(),
             },
             "normalizers": {
@@ -1753,6 +1779,9 @@ class CTDERAMTrainer:
         if self.ram_film is not None and models.get("ram_film") is not None:
             self.ram_film.load_state_dict(models["ram_film"])
             self.ram_film_tgt.load_state_dict(models.get("ram_film_tgt", models["ram_film"]))
+        if self.ram_mixer is not None and models.get("ram_mixer") is not None:
+            self.ram_mixer.load_state_dict(models["ram_mixer"])
+            self.ram_mixer_tgt.load_state_dict(models.get("ram_mixer_tgt", models["ram_mixer"]))
         self._load_low_level_state(models.get("low_level"))
         self._load_popart_state(ckpt.get("normalizers", {}).get("popart"))
         self._load_role_reward_norm_state(ckpt.get("normalizers", {}).get("role_reward"))
