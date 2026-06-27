@@ -83,8 +83,8 @@ class Expert_nu:
             raise ValueError(f"Unknown expert type: {self.expert}")
     
     def select_action(self, states: dict, condition=None) -> dict:
-        if condition is None:
-            condition = self.get_condition()
+        # if condition is None:
+        #     condition = self.get_condition()
         actions = {agent_id: self.predict_action(state, condition=condition[agent_id]) for agent_id, state in states.items()}
 
         return actions
@@ -94,9 +94,9 @@ class Expert_nu:
         if self.consensus:
             self.values4consensus = {agent_id: np.zeros((1, self.env.action_space.n)) for agent_id, state in states.items()}
             
-        if condition is None:
-            # See which phase we are by choosing self.nu > np.random.rand()
-            condition = self.get_condition()
+        # if condition is None:
+        #     # See which phase we are by choosing self.nu > np.random.rand()
+        #     condition = self.get_condition()
         # Predict the action for each agent
         actions = {agent_id: self.predict_masked_action(state, agent_id=agent_id, position=positions[agent_id], condition=condition[agent_id]) for agent_id, state in states.items()}
 
