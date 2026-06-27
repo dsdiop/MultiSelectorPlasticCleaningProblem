@@ -440,6 +440,11 @@ class CTDERAMTrainer:
             self.role_reward_norm = RunningMeanStdNormalizer()
         else:
             self.role_reward_norm = None
+        if self.ram_reward_mode == "delta_metrics":
+            print(
+                "[config] RAM reward normalization disabled for delta_metrics; "
+                "using raw metric-delta scalarization."
+            )
 
         self.step_count_low = 0
         self.step_count_ram = 0
@@ -780,6 +785,12 @@ class CTDERAMTrainer:
             scal_weights,
             method=self.role_scalarization,
         )
+        # Metric deltas are already bounded and calibrated task progress. Never
+        # fit or apply a second normalizer to them, irrespective of the CLI
+        # --role-reward-norm value. This also keeps HPR relabeling faithful to
+        # the stored raw per-window metric-delta components.
+        if self.ram_reward_mode == "delta_metrics":
+            return raw_scalar
         if self.role_reward_norm_name == "none":
             return raw_scalar
         if self.role_reward_norm_name == "minmax":
@@ -818,6 +829,7 @@ class CTDERAMTrainer:
             }
             done = False
             steps = 0
+            window_r_components = torch.zeros(self.K, device=self.device)
             while not done:
                 if expert_nu_mode:
                     W_np = self.rng.dirichlet(
@@ -837,23 +849,31 @@ class CTDERAMTrainer:
                 }
                 fleet_r = self._compute_step_reward_components(env, prev_metrics, r_vecs=r_vecs, info=info, curr_metrics=curr_metrics)
                 prev_metrics = curr_metrics
-                if self.role_reward_norm_name == "minmax":
-                    self.role_reward_norm.update(fleet_r)
-                elif self.role_reward_norm_name == "running_mean_std":
-                    # During warmup no Pareto preference is active yet, so use
-                    # equal weights just to seed the scalar R_RAM statistics.
-                    equal_w = torch.ones(self.K, dtype=torch.float32, device=self.device) / self.K
-                    self.role_reward_norm.update(
-                        self._scalarize_components(
-                            fleet_r,
-                            equal_w,
-                            method=self.role_scalarization,
-                        )
-                    )
+                if self.ram_reward_mode == "component_rewards":
+                    window_r_components += fleet_r
 
                 obs_all = obs_next
                 steps += 1
-                if max_steps_per_episode is not None and steps >= max_steps_per_episode:
+                reached_limit = max_steps_per_episode is not None and steps >= max_steps_per_episode
+                if (
+                    self.ram_reward_mode == "component_rewards"
+                    and ((steps % self.T_role == 0) or done or reached_limit)
+                ):
+                    if self.role_reward_norm_name == "minmax":
+                        self.role_reward_norm.update(window_r_components)
+                    elif self.role_reward_norm_name == "running_mean_std":
+                        # During warmup no Pareto preference is active yet, so
+                        # use equal weights to seed per-window scalar R_RAM stats.
+                        equal_w = torch.ones(self.K, dtype=torch.float32, device=self.device) / self.K
+                        self.role_reward_norm.update(
+                            self._scalarize_components(
+                                window_r_components,
+                                equal_w,
+                                method=self.role_scalarization,
+                            )
+                        )
+                    window_r_components.zero_()
+                if reached_limit:
                     break
 
     # ---------- action selection (low level) ----------
@@ -1217,9 +1237,6 @@ class CTDERAMTrainer:
                 r_accum += fleet_r
             else:
                 window_r_components += fleet_r
-                R_step = float(self._scalarize_role_reward(fleet_r, sw_t, update_norm=True).item())
-                R_role += R_step
-                m["total_reward"] += R_step
 
             for k in range(self.K):
                 lv = self.update_head(k)
@@ -1232,11 +1249,14 @@ class CTDERAMTrainer:
 
             if (ep_step % self.T_role == 0) or done:
                 if self.ram_reward_mode == "delta_metrics":
-                    fleet_r = r_accum
                     window_r_components = r_accum.clone()
-                    R_step = float(self._scalarize_role_reward(fleet_r, sw_t, update_norm=True).item())
-                    R_role = R_step
-                    m["total_reward"] += R_step
+                R_step = float(
+                    self._scalarize_role_reward(
+                        window_r_components, sw_t, update_norm=True
+                    ).item()
+                )
+                R_role = R_step
+                m["total_reward"] += R_step
                 learning_R_role = R_role - window_switch_penalty
                 z_next = self._encode_all(obs_all).detach()
                 extra_next = self._build_extra(env, r_accum, W, scal_weights)
