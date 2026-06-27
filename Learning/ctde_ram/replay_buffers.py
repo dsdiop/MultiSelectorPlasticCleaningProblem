@@ -146,7 +146,7 @@ class RoleReplayBuffer:
         if not state:
             return
         n = min(int(state.get("size", 0)), self.capacity)
-        self.ptr = n
+        self.ptr = int(state.get("ptr", n))
         self.size = n
         if n == 0:
             return
