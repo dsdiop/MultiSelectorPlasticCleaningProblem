@@ -38,6 +38,29 @@ class FiLMConditioner(nn.Module):
         return gamma, beta
 
 
+class DuelingRAMHead(nn.Module):
+    def __init__(self, input_dim: int, N: int, K: int, discrete_actions: int = 0):
+        super().__init__()
+        self.N = int(N)
+        self.K = int(K)
+        self.discrete_actions = int(discrete_actions)
+        if self.discrete_actions:
+            self.value = nn.Linear(input_dim, 1)
+            self.advantage = nn.Linear(input_dim, self.discrete_actions)
+        else:
+            self.value = nn.Linear(input_dim, self.N)
+            self.advantage = nn.Linear(input_dim, self.N * self.K)
+
+    def forward(self, hidden):
+        advantage = self.advantage(hidden)
+        if self.discrete_actions:
+            return self.value(hidden) + advantage - advantage.mean(dim=-1, keepdim=True)
+        advantage = advantage.view(-1, self.N, self.K)
+        value = self.value(hidden).unsqueeze(-1)
+        q = value + advantage - advantage.mean(dim=-1, keepdim=True)
+        return q.flatten(start_dim=1)
+
+
 class RoleSelectorAttention(nn.Module):
     def __init__(
         self, d_enc=128, d_ctx=256, K=2, d_role=64, d_extra=0,

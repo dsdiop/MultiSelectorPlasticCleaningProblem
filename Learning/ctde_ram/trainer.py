@@ -44,7 +44,7 @@ try:
     from .popart import PopArtNorm
     from .replay_buffers import LowLevelReplayBuffer, RoleReplayBuffer
     from .global_aggregator import GlobalAggregator
-    from .role_selector import FiLMConditioner, RoleSelectorAttention
+    from .role_selector import DuelingRAMHead, FiLMConditioner, RoleSelectorAttention
     from .pareto import sweep_scalarizations
     from .tb_logger import TBLogger
 except ImportError:
@@ -59,7 +59,7 @@ except ImportError:
     from popart import PopArtNorm
     from replay_buffers import LowLevelReplayBuffer, RoleReplayBuffer
     from global_aggregator import GlobalAggregator
-    from role_selector import FiLMConditioner, RoleSelectorAttention
+    from role_selector import DuelingRAMHead, FiLMConditioner, RoleSelectorAttention
     from pareto import sweep_scalarizations
     from tb_logger import TBLogger
 
@@ -230,6 +230,7 @@ class CTDERAMTrainer:
         hpr_fraction: float = 0.5,
         hpr_kappa: float = 1.0,
         w_conditioning: str = "concat",
+        ram_dueling: bool = False,
         # role_state_mode controls the mission/context vector appended to g.
         #
         #   flat   -> previous W is flattened; matches the original toy implementation,
@@ -297,6 +298,7 @@ class CTDERAMTrainer:
         self.w_conditioning = w_conditioning
         if self.w_conditioning not in {"concat", "film"}:
             raise ValueError("w_conditioning must be one of: concat, film")
+        self.ram_dueling = bool(ram_dueling)
         self.role_scalarization = role_scalarization.lower()
         self.q_scalarization = q_scalarization.lower()
         self.scalarization_power = float(scalarization_power)
@@ -377,10 +379,20 @@ class CTDERAMTrainer:
         ).to(self.device)
         self.role_selector_tgt = copy.deepcopy(self.role_selector).eval()
         ram_out = self.n_ram_actions if self.ram_mode == "discrete" else self.N * self.K
+        ram_head = nn.Linear(256, ram_out)
+        if self.ram_dueling and self.ram_mode in {"discrete", "factored"}:
+            ram_head = DuelingRAMHead(
+                256,
+                self.N,
+                self.K,
+                discrete_actions=self.n_ram_actions if self.ram_mode == "discrete" else 0,
+            )
+        elif self.ram_dueling and self.ram_mode == "soft_v2":
+            print("[warning] --ram-dueling does not apply to soft_v2; using the standard soft selector.")
         self.ram_q = nn.Sequential(
             nn.Linear(self.d_role_state, 256), nn.ReLU(),
             nn.Linear(256, 256), nn.ReLU(),
-            nn.Linear(256, ram_out),
+            ram_head,
         ).to(self.device)
         self.ram_q_tgt = copy.deepcopy(self.ram_q).eval()
         self.ram_film = (
@@ -1685,6 +1697,7 @@ class CTDERAMTrainer:
                 "hpr_fraction": self.hpr_fraction,
                 "hpr_kappa": self.hpr_kappa,
                 "w_conditioning": self.w_conditioning,
+                "ram_dueling": self.ram_dueling,
                 "role_state_mode": self.role_state_mode,
                 "role_reward_norm": self.role_reward_norm_name,
                 "role_scalarization": self.role_scalarization,
