@@ -228,10 +228,12 @@ class CTDERAMTrainer:
         soft_ram_temperature: float = 1.0,
         w_execution: str = "soft",
         role_switch_penalty: float = 0.0,
+        role_switch_penalty_rel: float = 0.0,
         hpr: bool = False,
         hpr_fraction: float = 0.5,
         hpr_kappa: float = 1.0,
         w_conditioning: str = "concat",
+        film_parameterization: str = "bounded",
         ram_dueling: bool = False,
         hfactored_mixer: str = "sum",
         # role_state_mode controls the mission/context vector appended to g.
@@ -291,6 +293,13 @@ class CTDERAMTrainer:
         self.role_switch_penalty = float(role_switch_penalty)
         if self.role_switch_penalty < 0.0:
             raise ValueError("role_switch_penalty must be non-negative")
+        self.role_switch_penalty_rel = float(role_switch_penalty_rel)
+        if self.role_switch_penalty_rel < 0.0:
+            raise ValueError("role_switch_penalty_rel must be non-negative")
+        if self.role_switch_penalty > 0.0 and self.role_switch_penalty_rel > 0.0:
+            raise ValueError("absolute and relative role-switch penalties are mutually exclusive")
+        self.role_reward_abs_mean = 0.0
+        self.role_reward_abs_count = 0
         self.hpr = bool(hpr)
         self.hpr_fraction = float(hpr_fraction)
         self.hpr_kappa = float(hpr_kappa)
@@ -301,6 +310,9 @@ class CTDERAMTrainer:
         self.w_conditioning = w_conditioning
         if self.w_conditioning not in {"concat", "film"}:
             raise ValueError("w_conditioning must be one of: concat, film")
+        self.film_parameterization = film_parameterization
+        if self.film_parameterization not in {"legacy", "bounded"}:
+            raise ValueError("film_parameterization must be one of: legacy, bounded")
         self.ram_dueling = bool(ram_dueling)
         self.hfactored_mixer = hfactored_mixer
         if self.hfactored_mixer not in {"sum", "qmix"}:
@@ -382,6 +394,7 @@ class CTDERAMTrainer:
         self.role_selector = RoleSelectorAttention(
             self.d_enc, d_ctx, self.K, d_role, d_extra=self.d_extra,
             w_conditioning=self.w_conditioning,
+            film_parameterization=self.film_parameterization,
         ).to(self.device)
         self.role_selector_tgt = copy.deepcopy(self.role_selector).eval()
         ram_out = self.n_ram_actions if self.ram_mode == "discrete" else self.N * self.K
@@ -402,7 +415,9 @@ class CTDERAMTrainer:
         ).to(self.device)
         self.ram_q_tgt = copy.deepcopy(self.ram_q).eval()
         self.ram_film = (
-            FiLMConditioner(self.K, 256).to(self.device)
+            FiLMConditioner(
+                self.K, 256, parameterization=self.film_parameterization
+            ).to(self.device)
             if self.w_conditioning == "film" else None
         )
         self.ram_film_tgt = copy.deepcopy(self.ram_film).eval() if self.ram_film is not None else None
@@ -950,13 +965,21 @@ class CTDERAMTrainer:
         new_executed_W: torch.Tensor,
         previous_executed_W: torch.Tensor,
     ) -> float:
-        if self.role_switch_penalty == 0.0:
+        if self.role_switch_penalty == 0.0 and self.role_switch_penalty_rel == 0.0:
             return 0.0
         if self.ram_mode == "soft_v2" and self.w_execution == "soft":
             distance = torch.norm(new_W - previous_W, p=1)
         else:
             distance = (new_executed_W.argmax(dim=-1) != previous_executed_W.argmax(dim=-1)).sum()
-        return self.role_switch_penalty * float(distance.item())
+        coefficient = self.role_switch_penalty
+        if self.role_switch_penalty_rel > 0.0:
+            coefficient = self.role_switch_penalty_rel * self.role_reward_abs_mean
+        return coefficient * float(distance.item())
+
+    def _update_role_reward_abs_mean(self, reward: float) -> None:
+        self.role_reward_abs_count += 1
+        delta = abs(float(reward)) - self.role_reward_abs_mean
+        self.role_reward_abs_mean += delta / self.role_reward_abs_count
 
     def _env_uses_expert_nu(self, env) -> bool:
         """True when env.step expects W/nu instead of movement actions."""
@@ -1258,6 +1281,7 @@ class CTDERAMTrainer:
                 R_role = R_step
                 m["total_reward"] += R_step
                 learning_R_role = R_role - window_switch_penalty
+                self._update_role_reward_abs_mean(R_role)
                 z_next = self._encode_all(obs_all).detach()
                 ram_state_r = (
                     r_accum
@@ -1328,6 +1352,7 @@ class CTDERAMTrainer:
             "last_ram_grad_abs_sum": float(self.last_ram_grad_abs_sum or 0.0),
             "mean_role_switch_penalty": float(np.mean(m["role_switch_penalties"]))
             if m["role_switch_penalties"] else 0.0,
+            "role_reward_abs_mean": float(self.role_reward_abs_mean),
         })
         for k in range(self.K):
             m[f"role{k}_frac"] = float(role_frac[k])
@@ -1777,10 +1802,12 @@ class CTDERAMTrainer:
                 "soft_ram_temperature": self.soft_ram_temperature,
                 "w_execution": self.w_execution,
                 "role_switch_penalty": self.role_switch_penalty,
+                "role_switch_penalty_rel": self.role_switch_penalty_rel,
                 "hpr": self.hpr,
                 "hpr_fraction": self.hpr_fraction,
                 "hpr_kappa": self.hpr_kappa,
                 "w_conditioning": self.w_conditioning,
+                "film_parameterization": self.film_parameterization,
                 "ram_dueling": self.ram_dueling,
                 "hfactored_mixer": self.hfactored_mixer,
                 "role_state_mode": self.role_state_mode,
@@ -1817,6 +1844,10 @@ class CTDERAMTrainer:
             "normalizers": {
                 "popart": self._popart_state(),
                 "role_reward": self._role_reward_norm_state(),
+                "switch_penalty_reward_scale": {
+                    "abs_mean": float(self.role_reward_abs_mean),
+                    "count": int(self.role_reward_abs_count),
+                },
             },
             "replay_buffers": {
                 "role": self.buf_role.state_dict(),
@@ -1846,6 +1877,9 @@ class CTDERAMTrainer:
         self._load_low_level_state(models.get("low_level"))
         self._load_popart_state(ckpt.get("normalizers", {}).get("popart"))
         self._load_role_reward_norm_state(ckpt.get("normalizers", {}).get("role_reward"))
+        switch_scale = ckpt.get("normalizers", {}).get("switch_penalty_reward_scale", {})
+        self.role_reward_abs_mean = float(switch_scale.get("abs_mean", self.role_reward_abs_mean))
+        self.role_reward_abs_count = int(switch_scale.get("count", self.role_reward_abs_count))
         self.buf_role.load_state_dict(ckpt.get("replay_buffers", {}).get("role"))
 
         steps = ckpt.get("steps", {})

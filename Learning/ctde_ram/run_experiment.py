@@ -178,12 +178,22 @@ def parse_args(argv=None):
         default=0.0,
         help="Penalty applied only to RAM learning reward when the selected role changes.",
     )
+    p.add_argument(
+        "--role-switch-penalty-rel",
+        type=float,
+        default=0.0,
+        help="Switch penalty as a fraction of the running mean absolute RAM reward.",
+    )
     p.add_argument("--hpr", action="store_true", help="Enable hindsight preference replay.")
     p.add_argument("--hpr-fraction", type=float, default=0.5, help="Fraction of each RAM batch to relabel.")
     p.add_argument("--hpr-kappa", type=float, default=1.0, help="Dirichlet concentration scale for HPR.")
     p.add_argument(
         "--w-conditioning", choices=["concat", "film"], default="concat",
         help="Preference conditioning for the RAM role network.",
+    )
+    p.add_argument(
+        "--film-parameterization", choices=["legacy", "bounded"], default="bounded",
+        help="FiLM modulation: original direct outputs or bounded residual scaling.",
     )
     p.add_argument("--ram-dueling", action="store_true", help="Use a dueling RAM head for discrete/factored modes.")
     p.add_argument(
@@ -420,10 +430,12 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         soft_ram_temperature=args.soft_ram_temperature,
         w_execution=args.w_execution,
         role_switch_penalty=args.role_switch_penalty,
+        role_switch_penalty_rel=args.role_switch_penalty_rel,
         hpr=args.hpr,
         hpr_fraction=args.hpr_fraction,
         hpr_kappa=args.hpr_kappa,
         w_conditioning=args.w_conditioning,
+        film_parameterization=args.film_parameterization,
         ram_dueling=args.ram_dueling,
         hfactored_mixer=args.hfactored_mixer,
         role_state_mode=args.role_state_mode,
@@ -575,12 +587,13 @@ def main():
                 ram=f"{ram_loss:.4f}",
                 refresh=False,
             )
-        progress_write(
-            f"[ep {ep:4d}] w=({w[0]:.2f},{w[1]:.2f}) R={m['total_reward']:.2f} "
-            f"switches={m['n_switches']} "
-            f"head_loss={head_loss:.4f} "
-            f"ram_loss={ram_loss:.4f}"
-        )
+        else:
+            progress_write(
+                f"[ep {ep:4d}] w=({w[0]:.2f},{w[1]:.2f}) R={m['total_reward']:.2f} "
+                f"switches={m['n_switches']} "
+                f"head_loss={head_loss:.4f} "
+                f"ram_loss={ram_loss:.4f}"
+            )
 
         if eval_every > 0 and ep % eval_every == 0:
             run_eval(ep)

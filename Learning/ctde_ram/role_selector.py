@@ -20,21 +20,44 @@ import torch.nn.functional as F
 
 
 class FiLMConditioner(nn.Module):
-    def __init__(self, preference_dim: int, feature_dim: int):
+    def __init__(
+        self,
+        preference_dim: int,
+        feature_dim: int,
+        parameterization: str = "bounded",
+        hidden_dim: int = 64,
+        gamma_scale: float = 0.5,
+        beta_scale: float = 0.1,
+    ):
         super().__init__()
         self.feature_dim = int(feature_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.parameterization = parameterization
+        self.gamma_scale = float(gamma_scale)
+        self.beta_scale = float(beta_scale)
+        if self.parameterization not in {"legacy", "bounded"}:
+            raise ValueError("FiLM parameterization must be one of: legacy, bounded")
         self.net = nn.Sequential(
-            nn.Linear(preference_dim, 32), nn.ReLU(),
-            nn.Linear(32, 32), nn.ReLU(),
-            nn.Linear(32, 2 * feature_dim),
+            nn.Linear(preference_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, 2 * feature_dim),
         )
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
-        with torch.no_grad():
-            self.net[-1].bias[:feature_dim].fill_(1.0)
+        if self.parameterization == "legacy":
+            with torch.no_grad():
+                self.net[-1].bias[:feature_dim].fill_(1.0)
 
     def forward(self, preference):
-        gamma, beta = self.net(preference).split(self.feature_dim, dim=-1)
+        if self.parameterization == "legacy":
+            return self.net(preference).split(self.feature_dim, dim=-1)
+        preference = preference / preference.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        raw_gamma, raw_beta = self.net(preference).split(self.feature_dim, dim=-1)
+        gamma = 1.0 + self.gamma_scale * torch.tanh(raw_gamma)
+        beta = self.beta_scale * torch.tanh(raw_beta)
         return gamma, beta
 
 
@@ -64,7 +87,7 @@ class DuelingRAMHead(nn.Module):
 class RoleSelectorAttention(nn.Module):
     def __init__(
         self, d_enc=128, d_ctx=256, K=2, d_role=64, d_extra=0,
-        w_conditioning="concat",
+        w_conditioning="concat", film_parameterization="bounded",
     ):
         super().__init__()
         self.K = K
@@ -73,7 +96,10 @@ class RoleSelectorAttention(nn.Module):
         self.d_extra = int(d_extra)
         self.query_proj = nn.Linear(d_enc + d_ctx + self.d_extra, d_role)
         self.w_conditioning = w_conditioning
-        self.film = FiLMConditioner(K, d_role) if w_conditioning == "film" else None
+        self.film = (
+            FiLMConditioner(K, d_role, parameterization=film_parameterization)
+            if w_conditioning == "film" else None
+        )
 
     def logits(self, z_all, g, extra=None):
         # z_all: (B, N, d_enc)

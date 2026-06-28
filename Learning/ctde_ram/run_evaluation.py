@@ -48,6 +48,8 @@ def namespace_from_checkpoint(ckpt: dict, eval_args) -> argparse.Namespace:
         if hasattr(train_args, key):
             setattr(train_args, key, value)
     runtime = ckpt.get("trainer_runtime", {})
+    if "film_parameterization" not in saved:
+        train_args.film_parameterization = "legacy"
     if getattr(train_args, "T_role", None) is None and runtime.get("T_role") is not None:
         train_args.T_role = int(runtime["T_role"])
 
