@@ -37,7 +37,9 @@ class AquaticMAEnv:
         # trash patch + visited patch + own(row,col,step_frac) + (N-1)*(dy,dx,occ)
         self.obs_dim = side * side * 2 + 3 + (N - 1) * 3
 
-    def reset(self) -> List[np.ndarray]:
+    def reset(self, seed: Optional[int] = None) -> List[np.ndarray]:
+        if seed is not None:
+            self.rng = np.random.default_rng(int(seed))
         self.trash[:] = 0.0
         self.visited[:] = 0.0
         self.step_count = 0

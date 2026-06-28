@@ -100,6 +100,12 @@ def main():
             "low_level_backend": low_level_backend,
             "T_role": t_role,
             "weight_grid": scal_grid,
+            "paired_episode_seeds": [
+                int(train_args.seed) + i for i in range(eval_args.episodes_per_w)
+            ],
+            "paired_probe_seeds": [
+                int(train_args.seed) + i for i in range(eval_args.probe_episodes)
+            ] if eval_args.probe else [],
         },
         "saved_run_config": ckpt.get("run_config", {}),
         "reconstructed_train_config": args_to_dict(train_args),
@@ -141,6 +147,7 @@ def main():
         "completed": 0,
         "total": len(scal_grid),
         "points": [],
+        "episode_seeds": [int(train_args.seed) + i for i in range(eval_args.episodes_per_w)],
     })
     result = trainer.evaluate_pareto(
         env,

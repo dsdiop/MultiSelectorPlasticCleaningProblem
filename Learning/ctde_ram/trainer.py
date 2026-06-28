@@ -20,6 +20,7 @@ import copy
 import csv
 import itertools
 import os
+import random
 from typing import Optional, Sequence
 
 import numpy as np
@@ -326,6 +327,7 @@ class CTDERAMTrainer:
         if self.ram_reward_mode not in {"component_rewards", "delta_metrics"}:
             raise ValueError("ram_reward_mode must be one of: component_rewards, delta_metrics")
         self.rng = np.random.default_rng(seed)
+        self.seed = int(seed)
         torch.manual_seed(seed)
 
         if obs_shape is None:
@@ -1366,7 +1368,50 @@ class CTDERAMTrainer:
 
     # ---------- greedy single-weight evaluation ----------
     @torch.no_grad()
-    def _evaluate_single(self, env, scal_weights, n_episodes: int = 5, show_progress: bool = False, progress_desc: Optional[str] = None):
+    def _capture_evaluation_rng_state(self):
+        return {
+            "trainer_rng": self.rng,
+            "trainer_rng_state": copy.deepcopy(self.rng.bit_generator.state),
+            "numpy": np.random.get_state(),
+            "python": random.getstate(),
+            "torch": torch.random.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        }
+
+    def _restore_evaluation_rng_state(self, state) -> None:
+        self.rng = state["trainer_rng"]
+        self.rng.bit_generator.state = state["trainer_rng_state"]
+        np.random.set_state(state["numpy"])
+        random.setstate(state["python"])
+        torch.random.set_rng_state(state["torch"])
+        if state["cuda"] is not None:
+            torch.cuda.set_rng_state_all(state["cuda"])
+        torch.backends.cudnn.deterministic = state["cudnn_deterministic"]
+        torch.backends.cudnn.benchmark = state["cudnn_benchmark"]
+
+    def _reset_evaluation_episode(self, env, seed: int):
+        seed = int(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        self.rng = np.random.default_rng(seed)
+        return env.reset(seed=seed)
+
+    def _evaluate_single(
+        self,
+        env,
+        scal_weights,
+        n_episodes: int = 5,
+        show_progress: bool = False,
+        progress_desc: Optional[str] = None,
+        episode_seeds=None,
+    ):
         scal_weights = np.asarray(scal_weights, dtype=np.float32)
         scal_weights = scal_weights / max(float(scal_weights.sum()), 1e-8)
         results = []
@@ -1379,8 +1424,12 @@ class CTDERAMTrainer:
                 unit="ep",
                 leave=False,
             )
-        for _ in episode_iter:
-            obs_all = env.reset()
+        if episode_seeds is None:
+            episode_seeds = [self.seed + i for i in range(n_episodes)]
+        if len(episode_seeds) != n_episodes:
+            raise ValueError("episode_seeds length must equal n_episodes")
+        for episode_i in episode_iter:
+            obs_all = self._reset_evaluation_episode(env, episode_seeds[episode_i])
             done = False
             ep_step = 0
             r_accum = torch.zeros(self.K, device=self.device)
@@ -1480,6 +1529,7 @@ class CTDERAMTrainer:
         save_csv: Optional[str] = None,
         plot_path: Optional[str] = None,
         pareto_plot_path: Optional[str] = None,
+        episode_seed_base: Optional[int] = None,
     ):
         """Sweep preference weights and report whether the selected roles move.
 
@@ -1495,6 +1545,9 @@ class CTDERAMTrainer:
             scal_grid = [(1.0, 0.0), (0.75, 0.25), (0.5, 0.5), (0.25, 0.75), (0.0, 1.0)]
 
         rows = []
+        rng_state = self._capture_evaluation_rng_state()
+        seed_base = self.seed if episode_seed_base is None else int(episode_seed_base)
+        episode_seeds = [seed_base + i for i in range(int(n_episodes_per_w))]
         for scal_weights in _progress(list(scal_grid), desc="probe weights", unit="w", leave=False):
             scal_weights = np.asarray(scal_weights, dtype=np.float32)
             scal_weights = scal_weights / max(float(scal_weights.sum()), 1e-8)
@@ -1504,13 +1557,13 @@ class CTDERAMTrainer:
             cleaned = []
 
             weight_label = ",".join(f"{float(x):.2f}" for x in scal_weights)
-            for _ in _progress(
+            for episode_i in _progress(
                 range(int(n_episodes_per_w)),
                 desc=f"probe episodes w=({weight_label})",
                 unit="ep",
                 leave=False,
             ):
-                obs_all = env.reset()
+                obs_all = self._reset_evaluation_episode(env, episode_seeds[episode_i])
                 done = False
                 ep_step = 0
                 r_accum = torch.zeros(self.K, device=self.device)
@@ -1565,6 +1618,7 @@ class CTDERAMTrainer:
                 row["mean_nu_role1"] = float(role_frac[1])
             rows.append(row)
 
+        self._restore_evaluation_rng_state(rng_state)
         _progress_write("[probe] preference sensitivity")
         for row in rows:
             argmax_bits = " ".join(
@@ -1651,8 +1705,12 @@ class CTDERAMTrainer:
         objective_keys=("coverage", "trash_cleaned"),
         ref_point=(0.0, 0.0),
         progress_callback=None,
+        episode_seed_base: Optional[int] = None,
     ):
         scal_grid = list(scal_grid)
+        seed_base = self.seed if episode_seed_base is None else int(episode_seed_base)
+        episode_seeds = [seed_base + i for i in range(int(n_episodes_per_w))]
+        rng_state = self._capture_evaluation_rng_state()
         completed_weights = 0
         eval_bar = tqdm(
             total=len(scal_grid),
@@ -1671,6 +1729,7 @@ class CTDERAMTrainer:
                 n_episodes=n_episodes_per_w,
                 show_progress=tqdm is not None,
                 progress_desc=f"eval episodes w=({weight_label})",
+                episode_seeds=episode_seeds,
             )
             self.tb.log_role_histogram(mm.pop("_role_counts", np.zeros(self.K, dtype=np.int64)))
             if eval_bar is not None:
@@ -1691,6 +1750,8 @@ class CTDERAMTrainer:
         finally:
             if eval_bar is not None:
                 eval_bar.close()
+            self._restore_evaluation_rng_state(rng_state)
+        result["episode_seeds"] = episode_seeds
         self.tb.log_pareto(result)
         _progress_write(
             f"[eval] hypervolume={result['hypervolume']:.4f} "

@@ -460,6 +460,9 @@ def main():
     np.random.seed(args.seed)
 
     env, low_level_backend, t_role = build_env(args)
+    eval_env, eval_backend, eval_t_role = build_env(args)
+    if eval_backend != low_level_backend or eval_t_role != t_role:
+        raise RuntimeError("training and evaluation environments resolved inconsistently")
     device = "cpu" if args.device < 0 or not torch.cuda.is_available() else f"cuda:{args.device}"
     args.run_name = make_run_name(args)
     run_dir = resolve_run_dir(args.output_dir, args.run_name)
@@ -501,11 +504,12 @@ def main():
         "device": device,
         "low_level_backend": low_level_backend,
         "T_role": t_role,
+        "paired_evaluation_seed_base": int(args.seed),
         "tensorboard_dir": trainer.tb.log_dir,
     })
 
     if args.check_frozen_popart:
-        report = trainer.check_frozen_popart_invariance(env)
+        report = trainer.check_frozen_popart_invariance(eval_env)
         status = "PASS" if report["ok"] else "FAIL"
         print(
             f"[check:frozen_popart] {status} reason={report['reason']} "
@@ -530,7 +534,7 @@ def main():
                 for t in np.linspace(0.0, 1.0, args.eval_points)
             ]
         latest_eval = trainer.evaluate_pareto(
-            env,
+            eval_env,
             scal_grid=[(1.0, 0.0), (0.5, 0.5), (0.0, 1.0)] if args.smoke
             else eval_points,
             n_episodes_per_w=eval_episodes,
@@ -625,7 +629,7 @@ def main():
         else:
             scal_grid = [(float(1.0 - t), float(t)) for t in np.linspace(0.0, 1.0, args.probe_points)]
         trainer.probe_preference_sensitivity(
-            env,
+            eval_env,
             scal_grid=scal_grid,
             n_episodes_per_w=args.probe_episodes,
             save_csv=args.probe_csv,
@@ -647,6 +651,8 @@ def main():
     trainer.close()
     if hasattr(env, "close"):
         env.close()
+    if hasattr(eval_env, "close"):
+        eval_env.close()
     print("done.")
 
 

@@ -17,16 +17,7 @@ class macro_plastic:
 
     def __init__(self, grid: np.ndarray, dt = 0.1, max_number_of_pollution_spots = 10, total_trash_elements = 100, seed = 0) -> None:
         """ Generador de ground truths de plásticos con dinámica """
-        self.seed = seed
-        self.rng = np.random.default_rng(seed=self.seed) # random number generator, it's better than set a np.random.seed() (https://builtin.com/data-science/numpy-random-seed)
-        self.rng_seed_for_steps = np.random.default_rng(seed=self.seed+1)
-        self.rng_steps = np.random.default_rng(seed=self.rng_seed_for_steps.integers(0, 1000000))  
-        # Random generators declaration #
-        self.rng_wind_direction = np.random.default_rng(seed=self.seed)
-        self.rng_number_of_trash_elements = np.random.default_rng(seed=self.seed)
-        self.rng_trash_positions_MVN = np.random.default_rng(seed=self.seed)
-        self.rng_pollution_spots_number = np.random.default_rng(seed=self.seed)
-        self.rng_pollution_spots_locations_indexes = np.random.default_rng(seed=self.seed)      
+        self.seed_rngs(seed)
         # Creamos un mapa vacio #
         self.map = np.zeros_like(grid)
         self.grid = grid
@@ -41,6 +32,18 @@ class macro_plastic:
         distances, self.closest_indices = distance_transform_edt(grid == 0, return_indices=True)
         
         self.discretized_particles = np.array([])
+
+    def seed_rngs(self, seed: int) -> None:
+        """Reset every RNG used for map generation and dynamic evolution."""
+        self.seed = int(seed)
+        self.rng = np.random.default_rng(seed=self.seed)
+        self.rng_seed_for_steps = np.random.default_rng(seed=self.seed + 1)
+        self.rng_steps = np.random.default_rng(seed=self.rng_seed_for_steps.integers(0, 1000000))
+        self.rng_wind_direction = np.random.default_rng(seed=self.seed)
+        self.rng_number_of_trash_elements = np.random.default_rng(seed=self.seed)
+        self.rng_trash_positions_MVN = np.random.default_rng(seed=self.seed)
+        self.rng_pollution_spots_number = np.random.default_rng(seed=self.seed)
+        self.rng_pollution_spots_locations_indexes = np.random.default_rng(seed=self.seed)
     def reset(self):
         #self.in_bound_particles = np.array([])
         self.pollution_spots_number = self.rng_pollution_spots_number.integers(3, self.max_number_of_pollution_spots+1)
@@ -192,10 +195,3 @@ if __name__ == '__main__':
 
         gt.render()
         plt.pause(0.5)
-
-    
-
-
-        
-        
-        

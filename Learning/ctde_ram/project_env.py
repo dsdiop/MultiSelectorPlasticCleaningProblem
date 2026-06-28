@@ -153,8 +153,8 @@ class ProjectPatrollingCTDEEnv:
             rewards.append(raw[list(self.reward_component_order)].astype(np.float32))
         return rewards
 
-    def reset(self):
-        obs, _ = self.env.reset()
+    def reset(self, seed=None):
+        obs, _ = self.env.reset(seed=seed)
         return self._format_obs(obs)
 
     def step(self, actions):
@@ -228,6 +228,11 @@ class ProjectPatrollingExpertNuCTDEEnv(ProjectPatrollingCTDEEnv):
                 raise ValueError(f"Expected nu vector length N={self.N}, got shape {arr.shape}")
             nu = arr
         return np.clip(nu.astype(np.float32), 0.0, 1.0)
+
+    def reset(self, seed=None):
+        if seed is not None:
+            self.rng = np.random.default_rng(int(seed))
+        return super().reset(seed=seed)
 
     def _state_float32(self, active_ids):
         state = getattr(self.env, "state", {})

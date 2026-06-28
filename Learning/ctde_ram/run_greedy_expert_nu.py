@@ -145,8 +145,12 @@ def collect_reward_stats(env_factory, episodes, seed):
     env = env_factory(0)
     rng = np.random.default_rng(seed)
     rewards = []
-    for _ in range(episodes):
-        env.reset()
+    for episode_i in range(episodes):
+        episode_seed = int(seed) + episode_i
+        random.seed(episode_seed)
+        np.random.seed(episode_seed)
+        torch.manual_seed(episode_seed)
+        env.reset(seed=episode_seed)
         done = False
         while not done:
             nu = rng.integers(0, 2, size=env.N).astype(np.float32)
@@ -157,12 +161,18 @@ def collect_reward_stats(env_factory, episodes, seed):
     return {"min_reward": values.min(axis=0), "max_reward": values.max(axis=0)}
 
 
-def evaluate_weight(env, selector, weights, episodes, t_role):
+def evaluate_weight(env, selector, weights, episodes, t_role, episode_seeds):
     coverages = []
     cleaned = []
     decisions = []
-    for _ in range(episodes):
-        env.reset()
+    for episode_i in range(episodes):
+        episode_seed = int(episode_seeds[episode_i])
+        random.seed(episode_seed)
+        np.random.seed(episode_seed)
+        torch.manual_seed(episode_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(episode_seed)
+        env.reset(seed=episode_seed)
         done = False
         step = 0
         selected = None
@@ -225,6 +235,9 @@ def main(argv=None):
                 [float(1.0 - t), float(t)]
                 for t in np.linspace(0.0, 1.0, args.probe_points)
             ],
+            "paired_episode_seeds": [
+                int(args.seed) + i for i in range(args.probe_episodes)
+            ],
         },
         "heuristic": "one_step_greedy_expert_nu",
         "has_checkpoint": False,
@@ -244,13 +257,27 @@ def main(argv=None):
 
     grid = np.linspace(0.0, 1.0, args.probe_points)
     weights = [np.asarray([1.0 - t, t], dtype=np.float32) for t in grid]
+    episode_seeds = [int(args.seed) + i for i in range(args.probe_episodes)]
     iterator = tqdm(weights, desc="greedy probe", unit="w", dynamic_ncols=True) if tqdm else weights
     rows = []
     write_json(progress_path, {
         "status": "running", "completed": 0, "total": len(weights), "points": []
     })
     for weight in iterator:
-        row = evaluate_weight(env, selector, weight, args.probe_episodes, args.T_role)
+        weight_selector = GreedyExpertNuSelector(
+            env,
+            greedy_type=args.greedy_type,
+            reward_stats=reward_stats,
+            normalize_rewards=not args.no_reward_normalization,
+        )
+        row = evaluate_weight(
+            env,
+            weight_selector,
+            weight,
+            args.probe_episodes,
+            args.T_role,
+            episode_seeds,
+        )
         rows.append(row)
         write_json(progress_path, {
             "status": "running",

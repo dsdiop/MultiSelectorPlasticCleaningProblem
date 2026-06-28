@@ -370,8 +370,14 @@ class MultiAgentPatrolling(gym.Env):
 		self.percentage_of_trash_cleaned = 0
 		self.percentage_of_map_visited = 0
   
-	def reset(self):
+	def reset(self, seed=None):
 		""" Reset the environment """
+		if seed is not None:
+			self.seed = int(seed)
+			self.rng_initial_positions = np.random.default_rng(self.seed)
+			if self.obstacles:
+				self.rng_obstacles = np.random.default_rng(self.seed)
+			self.gt.seed_rngs(self.seed)
 
 		# Reset the ground truth #
 		self.gt.reset()
