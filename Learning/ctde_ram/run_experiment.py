@@ -28,6 +28,7 @@ try:
         make_run_name,
         resolve_run_dir,
         save_pareto_artifacts,
+        write_csv_rows,
         write_json,
     )
     from .project_env import build_env_factory_from_existing_project, resolve_path_planner_ckpt
@@ -42,6 +43,7 @@ except ImportError:
         make_run_name,
         resolve_run_dir,
         save_pareto_artifacts,
+        write_csv_rows,
         write_json,
     )
     from project_env import build_env_factory_from_existing_project, resolve_path_planner_ckpt
@@ -146,7 +148,12 @@ def parse_args(argv=None):
     p.add_argument("--T-role", type=int, default=None)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gamma-role", type=float, default=None)
-    p.add_argument("--ram-mode", choices=["auto", "random", "discrete", "factored", "soft_v2"], default="auto")
+    p.add_argument(
+        "--ram-mode",
+        choices=["ppo_ram", "hard_role_q", "auto", "random", "discrete", "factored", "soft_v2"],
+        default="hard_role_q",
+        help="Main methods are ppo_ram and hard_role_q; remaining modes are legacy/baselines.",
+    )
     p.add_argument("--max-joint-role-actions", type=int, default=512)
     p.add_argument(
         "--global-agg",
@@ -243,10 +250,44 @@ def parse_args(argv=None):
         help="Exponential parameter p for EWC scalarization; default matches the greedy code.",
     )
     p.add_argument("--warmup-episodes", type=int, default=0)
+    # Shared main hard-role architecture.
+    p.add_argument("--d-model", type=int, default=64)
+    p.add_argument("--n-attn-heads", type=int, default=4)
+    p.add_argument("--n-attn-layers", type=int, default=1)
+    p.add_argument("--attn-ff-dim", type=int, default=128)
+    p.add_argument("--preference-role-bias", action="store_true", default=False)
+    # PPO-RAM.
+    p.add_argument("--ppo-epochs", type=int, default=4)
+    p.add_argument("--ppo-minibatch-size", type=int, default=128)
+    p.add_argument("--ppo-rollout-macro-steps", type=int, default=1024)
+    p.add_argument("--ppo-clip-eps", type=float, default=0.1)
+    p.add_argument("--gae-lambda", type=float, default=0.95)
+    p.add_argument("--entropy-coef", type=float, default=0.03)
+    p.add_argument("--value-coef", type=float, default=0.5)
+    p.add_argument("--actor-lr", type=float, default=1e-4)
+    p.add_argument("--critic-lr", type=float, default=1e-4)
+    p.add_argument("--ppo-target-kl", type=float, default=0.02)
+    p.add_argument("--ppo-max-grad-norm", type=float, default=0.5)
+    p.add_argument(
+        "--ppo-preference-sampling", choices=["stratified", "random"], default="random",
+        help="Stratified cycles through five fixed preferences so each PPO rollout mixes objectives.",
+    )
+    # HardRoleQ-RAM and PER.
+    p.add_argument("--role-q-lr", type=float, default=3e-4)
+    p.add_argument("--role-q-target-update", type=int, default=50)
+    p.add_argument("--role-q-mixer", choices=["none", "qmix"], default="none")
+    p.add_argument("--role-q-gamma", type=float, default=None)
+    p.add_argument("--role-q-epsilon-start", type=float, default=1.0)
+    p.add_argument("--role-q-epsilon-end", type=float, default=0.05)
+    p.add_argument("--role-q-epsilon-fraction", type=float, default=0.75)
+    p.add_argument("--per-alpha", type=float, default=0.6)
+    p.add_argument("--per-beta-start", type=float, default=0.4)
+    p.add_argument("--per-beta-end", type=float, default=1.0)
+    p.add_argument("--per-eps", type=float, default=1e-6)
     p.add_argument(
         "--weight-sampling",
         choices=["uniform", "beta"],
-        default="uniform",
+        default="beta",
         help=(
             "Preference weight sampler for training. 'beta' uses Dirichlet(alpha) "
             "(alpha<1, Beta(0.5,0.5) for K=2) to over-represent the front corners "
@@ -256,7 +297,7 @@ def parse_args(argv=None):
     p.add_argument(
         "--weight-alpha",
         type=float,
-        default=0.5,
+        default=0.4,
         help="Dirichlet/Beta concentration for --weight-sampling beta; <1 favors pure-preference extremes.",
     )
     p.add_argument(
@@ -289,6 +330,9 @@ def parse_args(argv=None):
         action="store_true",
         help="After training, report whether GlobalAggregator received nonzero RAM gradient.",
     )
+    p.add_argument("--forced-role-diagnostics", action="store_true", help="Evaluate fixed hard-role policies before training.")
+    p.add_argument("--forced-role-episodes", type=int, default=10)
+    p.add_argument("--same-state-preference-check", action="store_true", help="Compare extreme preferences on exactly the same state.")
 
     # Existing project environment recipe.
     p.add_argument("--map-csv", type=str, default=None)
@@ -446,6 +490,30 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         scalarization_power=args.scalarization_power,
         ewc_p=args.ewc_p,
         ram_reward_mode=args.ram_reward_mode,
+        d_model=args.d_model,
+        n_attn_heads=args.n_attn_heads,
+        n_attn_layers=args.n_attn_layers,
+        attn_ff_dim=args.attn_ff_dim,
+        preference_role_bias=args.preference_role_bias,
+        ppo_epochs=args.ppo_epochs,
+        ppo_minibatch_size=args.ppo_minibatch_size,
+        ppo_rollout_macro_steps=args.ppo_rollout_macro_steps,
+        ppo_clip_eps=args.ppo_clip_eps,
+        gae_lambda=args.gae_lambda,
+        entropy_coef=args.entropy_coef,
+        value_coef=args.value_coef,
+        actor_lr=args.actor_lr,
+        critic_lr=args.critic_lr,
+        ppo_target_kl=args.ppo_target_kl,
+        ppo_max_grad_norm=args.ppo_max_grad_norm,
+        role_q_lr=args.role_q_lr,
+        role_q_target_update=args.role_q_target_update,
+        role_q_mixer=args.role_q_mixer,
+        role_q_gamma=args.role_q_gamma,
+        per_alpha=args.per_alpha,
+        per_beta_start=args.per_beta_start,
+        per_beta_end=args.per_beta_end,
+        per_eps=args.per_eps,
         tb_logdir=tb_logdir or "./runs",
         tb_runname=tb_runname or ("ctde_ram_smoke" if args.smoke else f"ctde_ram_{args.env}"),
         batch_low=16 if args.smoke else 64,
@@ -490,6 +558,28 @@ def main():
     )
     trainer.tb.log_hparams_text(args_to_dict(args))
 
+    if trainer.main_hard_role_mode and args.forced_role_diagnostics:
+        forced_rows = trainer.evaluate_forced_role_policies(
+            eval_env, n_episodes=args.forced_role_episodes, seed_base=args.seed
+        )
+        write_csv_rows(os.path.join(metrics_dir, "forced_role_diagnostics.csv"), forced_rows)
+        write_json(os.path.join(metrics_dir, "forced_role_diagnostics.json"), {"rows": forced_rows})
+        for row in forced_rows:
+            progress_write(
+                f"[forced] {row['forced_policy']} coverage={row['coverage']:.4f} "
+                f"cleaned={row['trash_cleaned']:.4f} "
+                f"r_clean={row['clean_reward_return']:.2f} r_explore={row['explore_reward_return']:.2f}"
+            )
+
+    if trainer.main_hard_role_mode and args.same_state_preference_check:
+        preference_report = trainer.diagnose_same_state_preferences(eval_env, seed=args.seed)
+        write_json(os.path.join(metrics_dir, "same_state_preference_initial.json"), preference_report)
+        progress_write(
+            f"[preference-check] initial mean_abs_score_difference="
+            f"{preference_report['mean_abs_score_difference']:.8f} "
+            f"roles_differ={preference_report['roles_differ']}"
+        )
+
     if args.warmup_episodes > 0:
         print(f"[warmup] episodes={args.warmup_episodes}")
         trainer.warmup_normalizers(env, n_episodes=args.warmup_episodes)
@@ -523,6 +613,10 @@ def main():
     eval_every = args.eval_every if args.eval_every is not None else (3 if args.smoke else 50)
     eval_episodes = args.eval_episodes if args.eval_episodes is not None else (2 if args.smoke else 3)
     run_config = args_to_dict(args)
+    ppo_preference_grid = [
+        np.asarray(w, dtype=np.float32)
+        for w in ((1.0, 0.0), (0.8, 0.2), (0.5, 0.5), (0.2, 0.8), (0.0, 1.0))
+    ]
 
     def run_eval(eval_episode: int):
         nonlocal best_hv, latest_eval
@@ -551,6 +645,17 @@ def main():
             "png": paths["png"],
         })
         write_json(os.path.join(metrics_dir, "latest_eval.json"), latest_eval)
+        if trainer.main_hard_role_mode:
+            sensitivity = trainer.diagnose_same_state_preferences(eval_env, seed=args.seed)
+            write_json(
+                os.path.join(eval_dir, f"same_state_preference_ep_{eval_episode:05d}.json"),
+                sensitivity,
+            )
+            trainer.tb.log_scalar(
+                "eval/same_state_preference_score_delta",
+                sensitivity["mean_abs_score_difference"],
+                step=eval_episode,
+            )
         if float(latest_eval["hypervolume"]) > best_hv:
             best_hv = float(latest_eval["hypervolume"])
             best_path = os.path.join(ckpt_dir, "best_hv.pt")
@@ -569,8 +674,15 @@ def main():
 
     for ep in episode_iter:
         eps_low = max(0.05, 1.0 - ep / max(1, args.episodes * 0.5))
-        eps_ram = max(0.05, 1.0 - ep / max(1, args.episodes * 0.75))
-        w = sample_weights(rng, env.K, mode=args.weight_sampling, alpha=args.weight_alpha)
+        if args.ram_mode == "hard_role_q":
+            progress = min(ep / max(1, args.episodes * args.role_q_epsilon_fraction), 1.0)
+            eps_ram = args.role_q_epsilon_start + progress * (args.role_q_epsilon_end - args.role_q_epsilon_start)
+        else:
+            eps_ram = max(0.05, 1.0 - ep / max(1, args.episodes * 0.75))
+        if args.ram_mode == "ppo_ram" and args.ppo_preference_sampling == "stratified":
+            w = ppo_preference_grid[ep % len(ppo_preference_grid)].copy()
+        else:
+            w = sample_weights(rng, env.K, mode=args.weight_sampling, alpha=args.weight_alpha)
         m = trainer.run_episode(env, w, eps_low, eps_ram)
         head_loss = np.mean(m["head_losses"]) if m["head_losses"] else float("nan")
         ram_loss = np.mean(m["ram_losses"]) if m["ram_losses"] else float("nan")
@@ -583,14 +695,19 @@ def main():
             trainer.tb.log_scalar("train/weight_1", float(w[1]), step=ep)
         trainer.tb.flush()
         if tqdm is not None:
-            episode_iter.set_postfix(
+            postfix = dict(
                 w=f"({w[0]:.2f},{w[1]:.2f})",
                 R=f"{m['total_reward']:.2f}",
                 switches=m["n_switches"],
-                head=f"{head_loss:.4f}",
                 ram=f"{ram_loss:.4f}",
-                refresh=False,
             )
+            if trainer.main_hard_role_mode:
+                postfix["role1"] = f"{m['role1_frac']:.3f}"
+                if trainer.ram_mode == "ppo_ram":
+                    postfix["rollout"] = m["ppo_rollout_size"]
+            else:
+                postfix["head"] = f"{head_loss:.4f}"
+            episode_iter.set_postfix(refresh=False, **postfix)
         else:
             progress_write(
                 f"[ep {ep:4d}] w=({w[0]:.2f},{w[1]:.2f}) R={m['total_reward']:.2f} "
@@ -599,8 +716,8 @@ def main():
                 f"ram_loss={ram_loss:.4f}"
             )
 
-        if eval_every > 0 and ep % eval_every == 0:
-            run_eval(ep)
+        if eval_every > 0 and (ep + 1) % eval_every == 0:
+            run_eval(ep + 1)
 
         if args.save_every > 0 and (ep + 1) % args.save_every == 0:
             periodic_path = os.path.join(ckpt_dir, f"episode_{ep + 1:05d}.pt")
@@ -609,8 +726,15 @@ def main():
             trainer.save_checkpoint(latest_path, run_config=run_config, episode=ep, metrics=m)
             progress_write(f"[checkpoint] saved={periodic_path}")
 
-    # Periodic evaluation uses zero-based training indices (0, 500, ...). Run
-    # one additional sweep after all updates so the fully trained policy always
+    # Do not discard a final partial mixed-preference PPO rollout.
+    final_ppo_update = trainer.flush_main_method_updates()
+    if final_ppo_update is not None:
+        progress_write(
+            f"[ppo] flushed partial rollout loss={final_ppo_update.loss:.6f} "
+            f"kl={final_ppo_update.approx_kl:.6f}"
+        )
+
+    # Run one additional sweep after all updates so the fully trained policy always
     # has an eval_ep_<episodes> artifact (for example eval_ep_05000).
     if eval_every > 0:
         run_eval(args.episodes)
@@ -635,6 +759,7 @@ def main():
             save_csv=args.probe_csv,
             plot_path=args.probe_plot,
             pareto_plot_path=args.probe_pareto_plot,
+            attention_path=os.path.join(fig_dir, "hard_role_attention.npz") if trainer.main_hard_role_mode else None,
         )
 
     final_path = os.path.join(ckpt_dir, "final.pt")
