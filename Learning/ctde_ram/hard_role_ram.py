@@ -16,6 +16,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
+try:
+    from .popart import PopArtNorm
+except ImportError:
+    from popart import PopArtNorm
+
 
 class AllocentricMapCNN(nn.Module):
     """One shared CNN over the complete three-channel map stack."""
@@ -145,14 +150,31 @@ class PPOActor(nn.Module):
 
 
 class PPOCritic(nn.Module):
-    def __init__(self, **trunk_kwargs):
+    def __init__(self, n_values: int = 1, **trunk_kwargs):
         super().__init__()
         self.trunk = HardRoleAttentionTrunk(**trunk_kwargs)
-        self.value_head = nn.Linear(self.trunk.d_model, 1)
+        self.n_values = int(n_values)
+        if self.n_values <= 0:
+            raise ValueError("n_values must be positive")
+        # Keep the legacy scalar key (`value_head.*`) checkpoint-compatible.
+        # Vector critics use separate final layers so PopArt can preserve each
+        # objective's unnormalized prediction independently.
+        if self.n_values == 1:
+            self.value_head = nn.Linear(self.trunk.d_model, 1)
+        else:
+            self.value_heads = nn.ModuleList([
+                nn.Linear(self.trunk.d_model, 1) for _ in range(self.n_values)
+            ])
 
     def forward(self, maps, previous_roles, budget, preference):
         h, _ = self.trunk(maps, previous_roles, budget, preference)
-        return self.value_head(h.mean(dim=1)).squeeze(-1)
+        pooled = h.mean(dim=1)
+        if self.n_values == 1:
+            return self.value_head(pooled).squeeze(-1)
+        return torch.cat([head(pooled) for head in self.value_heads], dim=-1)
+
+    def popart_heads(self):
+        return [self.value_head] if self.n_values == 1 else list(self.value_heads)
 
 
 class HardRoleQNetwork(nn.Module):
@@ -210,7 +232,10 @@ class PPORAMLearner:
         self, actor: PPOActor, critic: PPOCritic, actor_lr=3e-4, critic_lr=3e-4,
         epochs=4, minibatch_size=32, clip_eps=0.2, gae_lambda=0.95,
         entropy_coef=0.01, value_coef=0.5, gamma=0.99, target_kl=0.02,
-        max_grad_norm=0.5, device="cpu",
+        max_grad_norm=0.5, device="cpu", critic_mode="scalar",
+        critic_popart=False, popart_alpha=1e-3,
+        advantage_scalarization="ws", scalarization_power=3.0,
+        ewc_p=1.0,
     ):
         self.actor, self.critic = actor, critic
         self.actor_optim = torch.optim.Adam(actor.parameters(), lr=actor_lr)
@@ -221,22 +246,103 @@ class PPORAMLearner:
         self.target_kl = None if target_kl is None or target_kl <= 0 else float(target_kl)
         self.max_grad_norm = float(max_grad_norm)
         self.device = torch.device(device)
+        self.critic_mode = critic_mode.lower()
+        self.vector_critic = self.critic_mode == "vector"
+        if self.critic_mode not in {"scalar", "vector"}:
+            raise ValueError("critic_mode must be scalar or vector")
+        self.advantage_scalarization = advantage_scalarization.lower()
+        if self.advantage_scalarization not in {"ws", "wp", "wpop", "ewc"}:
+            raise ValueError("advantage_scalarization must be one of: ws, wp, wpop, ewc")
+        if not self.vector_critic and self.advantage_scalarization != "ws":
+            raise ValueError("nonlinear advantage scalarization requires --ppo-critic-mode vector")
+        self.scalarization_power, self.ewc_p = float(scalarization_power), float(ewc_p)
+        self.scalarization_eps = 1e-8
+        self.critic_popart = bool(critic_popart)
+        n_values = 2 if self.vector_critic else 1
+        self.popart = (
+            [PopArtNorm(head, alpha=popart_alpha, rescale=True) for head in critic.popart_heads()]
+            if self.critic_popart else []
+        )
+
+    def denormalize_values(self, values: torch.Tensor) -> torch.Tensor:
+        if not self.popart:
+            return values
+        if self.vector_critic:
+            return torch.stack([pa.denormalize(values[..., k]) for k, pa in enumerate(self.popart)], dim=-1)
+        return self.popart[0].denormalize(values)
+
+    def _normalize_value_targets(self, returns: torch.Tensor) -> torch.Tensor:
+        if not self.popart:
+            return returns
+        for k, pa in enumerate(self.popart):
+            targets = returns[..., k] if self.vector_critic else returns
+            pa.update(targets)
+        if self.vector_critic:
+            return torch.stack([pa.normalize_target(returns[..., k]) for k, pa in enumerate(self.popart)], dim=-1)
+        return self.popart[0].normalize_target(returns)
+
+    def _scalarize_advantages(self, advantages: torch.Tensor, preference: torch.Tensor) -> torch.Tensor:
+        # Per-objective standardization keeps a preference weight semantically
+        # comparable even when the objective returns have different scales.
+        mean = advantages.mean(dim=0, keepdim=True)
+        std = advantages.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
+        z = (advantages - mean) / std
+        weights = preference / preference.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        if self.advantage_scalarization == "ws":
+            scalar = (weights * z).sum(dim=-1)
+            return (scalar - scalar.mean()) / scalar.std(unbiased=False).clamp_min(1e-8)
+        # Product/power scalarizers need non-negative inputs. A rollout-local,
+        # per-objective min-max mapping retains ordering and avoids invalid
+        # fractional powers of signed GAE values.
+        lo, hi = z.amin(dim=0, keepdim=True), z.amax(dim=0, keepdim=True)
+        positive = (z - lo) / (hi - lo).clamp_min(1e-8)
+        positive = positive.clamp_min(self.scalarization_eps)
+        if self.advantage_scalarization == "wp":
+            scalar = (weights * positive.pow(self.scalarization_power)).sum(dim=-1)
+        elif self.advantage_scalarization == "wpop":
+            scalar = torch.prod(positive.pow(weights), dim=-1)
+        else:
+            weight_gain = torch.exp(self.ewc_p * weights) - 1.0
+            scalar = (weight_gain * torch.exp(self.ewc_p * positive)).sum(dim=-1)
+        # PPO needs a signed learning signal. Nonlinear scores are positive by
+        # construction, so center/scale the final scalarized score.
+        return (scalar - scalar.mean()) / scalar.std(unbiased=False).clamp_min(1e-8)
+
+    def popart_state_dict(self):
+        return [
+            {"mu": pa.mu, "mu_sq": pa.mu_sq, "sigma": pa.sigma, "alpha": pa.alpha}
+            for pa in self.popart
+        ]
+
+    def load_popart_state_dict(self, states):
+        if not states:
+            return
+        for pa, state in zip(self.popart, states):
+            pa.mu = float(state.get("mu", pa.mu))
+            pa.mu_sq = float(state.get("mu_sq", pa.mu_sq))
+            pa.sigma = float(state.get("sigma", pa.sigma))
 
     def update(self, rollout):
         if len(rollout) == 0:
             return None
         data = rollout.as_tensors(self.device)
         with torch.no_grad():
-            next_values = self.critic(data["next_maps"], data["next_previous_roles"], data["next_budget"], data["preference"])
+            next_values = self.denormalize_values(self.critic(data["next_maps"], data["next_previous_roles"], data["next_budget"], data["preference"]))
             discounts = self.gamma ** data["duration"]
-            deltas = data["reward"] + discounts * next_values * (1.0 - data["done"]) - data["value"]
+            bootstrap_discount = discounts.unsqueeze(-1) if self.vector_critic else discounts
+            bootstrap_mask = (1.0 - data["done"]).unsqueeze(-1) if self.vector_critic else (1.0 - data["done"])
+            deltas = data["reward"] + bootstrap_discount * next_values * bootstrap_mask - data["value"]
             advantages = torch.zeros_like(deltas)
             gae = torch.zeros((), device=self.device)
             for t in range(len(deltas) - 1, -1, -1):
                 gae = deltas[t] + discounts[t] * self.gae_lambda * (1.0 - data["done"][t]) * gae
                 advantages[t] = gae
             returns = advantages + data["value"]
-            advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
+            if self.vector_critic:
+                advantages = self._scalarize_advantages(advantages, data["preference"])
+            else:
+                advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
+            value_targets = self._normalize_value_targets(returns)
 
         metrics = []
         count = len(advantages)
@@ -255,7 +361,7 @@ class PPORAMLearner:
                 policy_loss = -torch.min(unclipped, clipped).mean()
                 entropy = dist.entropy().mean()
                 value = self.critic(data["maps"][idx], data["previous_roles"][idx], data["budget"][idx], data["preference"][idx])
-                value_loss = F.mse_loss(value, returns[idx])
+                value_loss = F.mse_loss(value, value_targets[idx])
 
                 self.actor_optim.zero_grad()
                 (policy_loss - self.entropy_coef * entropy).backward()

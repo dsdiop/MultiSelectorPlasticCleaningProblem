@@ -266,6 +266,19 @@ def parse_args(argv=None):
     p.add_argument("--value-coef", type=float, default=0.5)
     p.add_argument("--actor-lr", type=float, default=1e-4)
     p.add_argument("--critic-lr", type=float, default=1e-4)
+    p.add_argument(
+        "--ppo-critic-mode", choices=["scalar", "vector"], default="scalar",
+        help="Scalar legacy critic or one value estimate per reward objective.",
+    )
+    p.add_argument(
+        "--ppo-critic-popart", action="store_true",
+        help="Apply independent PopArt normalization to each PPO critic output.",
+    )
+    p.add_argument(
+        "--ppo-advantage-scalarization",
+        choices=["ws", "wp", "wpop", "ewc"], default="ws",
+        help="How vector GAE advantages are combined for the PPO actor update.",
+    )
     p.add_argument("--ppo-target-kl", type=float, default=0.02)
     p.add_argument("--ppo-max-grad-norm", type=float, default=0.5)
     p.add_argument(
@@ -504,6 +517,9 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         value_coef=args.value_coef,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
+        ppo_critic_mode=args.ppo_critic_mode,
+        ppo_critic_popart=args.ppo_critic_popart,
+        ppo_advantage_scalarization=args.ppo_advantage_scalarization,
         ppo_target_kl=args.ppo_target_kl,
         ppo_max_grad_norm=args.ppo_max_grad_norm,
         role_q_lr=args.role_q_lr,

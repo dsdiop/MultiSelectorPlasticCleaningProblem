@@ -19,6 +19,8 @@ set -euo pipefail
 #
 # Focused alternatives/ablations:
 #   PPOT1            PPO with role decision every environment step
+#   PPOT1WPOP        PPO T1 with WPOP role-reward scalarization
+#   PPOT1VectorWPOP  PPO T1 with vector critic, PopArt, WPOP advantages
 #   HardQT1          HardRoleQ with role decision every environment step
 #   PPOT20           longer role commitment
 #   HardQT20         longer role commitment
@@ -100,7 +102,10 @@ EXP="$(echo "${EXP_RAW}" | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
 METHOD_TAG=""
 MODE_ARGS=()
 EXTRA_ARGS=()
-ROLE_SCALARIZATION="ws"
+ROLE_SCALARIZATION="${ROLE_SCALARIZATION:-ws}"
+PPO_CRITIC_MODE="${PPO_CRITIC_MODE:-scalar}"
+PPO_CRITIC_POPART="${PPO_CRITIC_POPART:-0}"
+PPO_ADVANTAGE_SCALARIZATION="${PPO_ADVANTAGE_SCALARIZATION:-ws}"
 RUN_T_ROLE="${T_ROLE}"
 
 case "${EXP}" in
@@ -122,6 +127,20 @@ case "${EXP}" in
     ppot1|ppo_t1)
         METHOD_TAG="PPO_RAM_FiLM_Attn_T1"
         RUN_T_ROLE=1
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1wpop|ppo_t1_wpop)
+        METHOD_TAG="PPO_RAM_FiLM_Attn_T1_WPOP"
+        RUN_T_ROLE=1
+        ROLE_SCALARIZATION="wpop"
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1vectorwpop|ppo_t1_vector_wpop)
+        METHOD_TAG="PPO_RAM_FiLM_Attn_T1_VectorCritic_PopArt_AdvWPOP"
+        RUN_T_ROLE=1
+        PPO_CRITIC_MODE="vector"
+        PPO_CRITIC_POPART=1
+        PPO_ADVANTAGE_SCALARIZATION="wpop"
         MODE_ARGS=(--ram-mode ppo_ram)
         ;;
     hardqt1|hardq_t1)
@@ -262,7 +281,7 @@ COMMON_ARGS=(
     --n-attn-layers "${N_ATTN_LAYERS}"
     --attn-ff-dim "${ATTN_FF_DIM}"
     --ppo-epochs 4
-    --ppo-minibatch-size 128
+    --ppo-minibatch-size 256
     --ppo-rollout-macro-steps 2048
     --ppo-clip-eps 0.1
     --gae-lambda 0.95
@@ -270,6 +289,8 @@ COMMON_ARGS=(
     --value-coef 0.5
     --actor-lr 0.0001
     --critic-lr 0.0001
+    --ppo-critic-mode "${PPO_CRITIC_MODE}"
+    --ppo-advantage-scalarization "${PPO_ADVANTAGE_SCALARIZATION}"
     --ppo-target-kl 0.02
     --ppo-max-grad-norm 0.5
     --ppo-preference-sampling random
@@ -299,6 +320,10 @@ COMMON_ARGS=(
     --output-dir "${OUTPUT_DIR}"
 )
 
+if [[ "${PPO_CRITIC_POPART}" == "1" ]]; then
+    COMMON_ARGS+=(--ppo-critic-popart)
+fi
+
 {
     echo "#!/usr/bin/env bash"
     printf "cd %q\n" "${PROJECT_ROOT}"
@@ -315,6 +340,8 @@ echo "[launch] run_name   : ${RUN_NAME}"
 echo "[launch] device     : ${DEVICE}"
 echo "[launch] map        : ${MAP_NAME}"
 echo "[launch] T_role     : ${RUN_T_ROLE}"
+echo "[launch] critic     : ${PPO_CRITIC_MODE} (popart=${PPO_CRITIC_POPART})"
+echo "[launch] advantage  : ${PPO_ADVANTAGE_SCALARIZATION}"
 echo "[launch] episodes   : ${EPISODES}"
 echo "[launch] tmux       : ${SESSION_NAME}"
 echo "[launch] log        : ${LOG_FILE}"

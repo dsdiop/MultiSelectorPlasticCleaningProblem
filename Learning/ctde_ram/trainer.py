@@ -292,6 +292,9 @@ class CTDERAMTrainer:
         value_coef: float = 0.5,
         actor_lr: float = 1e-4,
         critic_lr: float = 1e-4,
+        ppo_critic_mode: str = "scalar",
+        ppo_critic_popart: bool = False,
+        ppo_advantage_scalarization: str = "ws",
         ppo_target_kl: float = 0.02,
         ppo_max_grad_norm: float = 0.5,
         role_q_lr: float = 3e-4,
@@ -381,6 +384,9 @@ class CTDERAMTrainer:
         self.per_beta_progress = 0
         self.hard_role_gamma = self.gamma if role_q_gamma is None else float(role_q_gamma)
         self.ppo_rollout_macro_steps = int(ppo_rollout_macro_steps)
+        self.ppo_critic_mode = ppo_critic_mode.lower()
+        self.ppo_critic_popart = bool(ppo_critic_popart)
+        self.ppo_advantage_scalarization = ppo_advantage_scalarization.lower()
         if self.main_hard_role_mode and ram_mode == "ppo_ram" and self.ppo_rollout_macro_steps <= 0:
             raise ValueError("ppo_rollout_macro_steps must be positive")
 
@@ -494,12 +500,21 @@ class CTDERAMTrainer:
         self.hard_role_q = self.hard_role_q_learner = self.hard_role_replay = None
         if self.ram_mode == "ppo_ram":
             self.ppo_actor = PPOActor(**trunk_args).to(self.device)
-            self.ppo_critic = PPOCritic(**trunk_args).to(self.device)
+            self.ppo_critic = PPOCritic(
+                n_values=self.K if self.ppo_critic_mode == "vector" else 1,
+                **trunk_args,
+            ).to(self.device)
             self.ppo_rollout = PPORoleRolloutBuffer()
             self.ppo_learner = PPORAMLearner(
                 self.ppo_actor, self.ppo_critic, actor_lr, critic_lr, ppo_epochs,
                 ppo_minibatch_size, ppo_clip_eps, gae_lambda, entropy_coef,
                 value_coef, gamma, ppo_target_kl, ppo_max_grad_norm, self.device,
+                critic_mode=self.ppo_critic_mode,
+                critic_popart=self.ppo_critic_popart,
+                popart_alpha=self.popart_alpha,
+                advantage_scalarization=self.ppo_advantage_scalarization,
+                scalarization_power=self.scalarization_power,
+                ewc_p=self.ewc_p,
             )
         elif self.ram_mode == "hard_role_q":
             self.hard_role_q = HardRoleQNetwork(**trunk_args).to(self.device)
@@ -1277,7 +1292,9 @@ class CTDERAMTrainer:
                 maps, previous, budget, preference,
                 deterministic=not training, return_attn=return_attn,
             )
-            value = self.ppo_critic(maps, previous, budget, preference)
+            value = self.ppo_learner.denormalize_values(
+                self.ppo_critic(maps, previous, budget, preference)
+            )
             logits = self.ppo_actor(maps, previous, budget, preference)
             if not torch.isfinite(logits).all() or not torch.isfinite(value).all():
                 raise FloatingPointError("Non-finite PPO role logits or critic value")
@@ -1357,6 +1374,7 @@ class CTDERAMTrainer:
                 })
 
             macro_reward, duration = 0.0, 0
+            macro_reward_vector = np.zeros(self.K, dtype=np.float32)
             while duration < self.T_role and not done:
                 obs_next, r_vecs, done, info, _ = self._step_env_with_hard_roles(
                     env, obs_all, roles, epsilon_low if training else 0.0
@@ -1384,6 +1402,9 @@ class CTDERAMTrainer:
                 reward_steps += 1
                 macro_gamma = self.hard_role_gamma if self.ram_mode == "hard_role_q" else self.gamma
                 macro_reward += (macro_gamma ** duration) * float(scalar_step.item())
+                macro_reward_vector += (macro_gamma ** duration) * _tensor_to_numpy(
+                    normalized_components, dtype=np.float32
+                )
                 obs_all = obs_next
                 duration += 1
                 ep_step += 1
@@ -1394,7 +1415,8 @@ class CTDERAMTrainer:
                 self.ppo_rollout.store(
                     maps=start_obs, preference=scal_weights, previous_roles=start_prev,
                     roles=roles_np, old_logprob=float(policy_info["logprob"].item()),
-                    value=float(policy_info["value"].item()), reward=macro_reward,
+                    value=_tensor_to_numpy(policy_info["value"], dtype=np.float32),
+                    reward=(macro_reward_vector if self.ppo_critic_mode == "vector" else macro_reward),
                     done=float(done), duration=float(duration), budget=[start_budget],
                     next_maps=next_obs, next_previous_roles=roles_np,
                     next_budget=[next_budget],
@@ -2315,6 +2337,9 @@ class CTDERAMTrainer:
                 "role_reward_norm": self.role_reward_norm_name,
                 "role_scalarization": self.role_scalarization,
                 "q_scalarization": self.q_scalarization,
+                "ppo_critic_mode": self.ppo_critic_mode,
+                "ppo_critic_popart": self.ppo_critic_popart,
+                "ppo_advantage_scalarization": self.ppo_advantage_scalarization,
                 "ram_reward_mode": self.ram_reward_mode,
                 "global_agg_mode": self.global_agg_mode,
                 "low_level_backend": self.low_level_backend,
@@ -2350,6 +2375,9 @@ class CTDERAMTrainer:
             },
             "normalizers": {
                 "popart": self._popart_state(),
+                "ppo_critic_popart": (
+                    None if self.ppo_learner is None else self.ppo_learner.popart_state_dict()
+                ),
                 "role_reward": self._role_reward_norm_state(),
                 "switch_penalty_reward_scale": {
                     "abs_mean": float(self.role_reward_abs_mean),
@@ -2394,6 +2422,10 @@ class CTDERAMTrainer:
                 self.hard_role_q_learner.mixer.load_state_dict(models["hard_role_q_mixer"])
                 self.hard_role_q_learner.target_mixer.load_state_dict(models.get("hard_role_q_target_mixer", models["hard_role_q_mixer"]))
         self._load_popart_state(ckpt.get("normalizers", {}).get("popart"))
+        if self.ppo_learner is not None:
+            self.ppo_learner.load_popart_state_dict(
+                ckpt.get("normalizers", {}).get("ppo_critic_popart")
+            )
         self._load_role_reward_norm_state(ckpt.get("normalizers", {}).get("role_reward"))
         switch_scale = ckpt.get("normalizers", {}).get("switch_penalty_reward_scale", {})
         self.role_reward_abs_mean = float(switch_scale.get("abs_mean", self.role_reward_abs_mean))
