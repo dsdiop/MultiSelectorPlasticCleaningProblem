@@ -43,7 +43,11 @@ try:
         set_requires_grad,
     )
     from .popart import PopArtNorm
-    from .replay_buffers import LowLevelReplayBuffer, RoleReplayBuffer
+    from .replay_buffers import (
+        LowLevelReplayBuffer, RoleReplayBuffer, PPORoleRolloutBuffer,
+        PrioritizedHardRoleReplayBuffer,
+    )
+    from .hard_role_ram import PPOActor, PPOCritic, PPORAMLearner, HardRoleQNetwork, HardRoleQLearner
     from .global_aggregator import GlobalAggregator, MonotonicQMixer
     from .role_selector import DuelingRAMHead, FiLMConditioner, RoleSelectorAttention
     from .pareto import hypervolume, pareto_front, sweep_scalarizations
@@ -59,7 +63,11 @@ except ImportError:
         set_requires_grad,
     )
     from popart import PopArtNorm
-    from replay_buffers import LowLevelReplayBuffer, RoleReplayBuffer
+    from replay_buffers import (
+        LowLevelReplayBuffer, RoleReplayBuffer, PPORoleRolloutBuffer,
+        PrioritizedHardRoleReplayBuffer,
+    )
+    from hard_role_ram import PPOActor, PPOCritic, PPORAMLearner, HardRoleQNetwork, HardRoleQLearner
     from global_aggregator import GlobalAggregator, MonotonicQMixer
     from role_selector import DuelingRAMHead, FiLMConditioner, RoleSelectorAttention
     from pareto import hypervolume, pareto_front, sweep_scalarizations
@@ -269,6 +277,31 @@ class CTDERAMTrainer:
         scalarization_power: float = 3.0,
         ewc_p: float = 1.0,
         ram_reward_mode: str = "component_rewards",
+        # Main hard-role methods. The older modes below remain legacy-compatible.
+        d_model: int = 64,
+        n_attn_heads: int = 4,
+        n_attn_layers: int = 1,
+        attn_ff_dim: int = 128,
+        preference_role_bias: bool = False,
+        ppo_epochs: int = 4,
+        ppo_minibatch_size: int = 128,
+        ppo_rollout_macro_steps: int = 1024,
+        ppo_clip_eps: float = 0.1,
+        gae_lambda: float = 0.95,
+        entropy_coef: float = 0.03,
+        value_coef: float = 0.5,
+        actor_lr: float = 1e-4,
+        critic_lr: float = 1e-4,
+        ppo_target_kl: float = 0.02,
+        ppo_max_grad_norm: float = 0.5,
+        role_q_lr: float = 3e-4,
+        role_q_target_update: int = 50,
+        role_q_mixer: str = "none",
+        role_q_gamma: Optional[float] = None,
+        per_alpha: float = 0.6,
+        per_beta_start: float = 0.4,
+        per_beta_end: float = 1.0,
+        per_eps: float = 1e-6,
         tb_logdir: str = "./runs",
         tb_runname: str = "ctde_ram_v1",
     ):
@@ -334,6 +367,22 @@ class CTDERAMTrainer:
             obs_shape = tuple(obs_dim) if isinstance(obs_dim, (tuple, list)) else (int(obs_dim),)
         self.obs_shape = tuple(obs_shape)
         self.obs_dim_flat = int(np.prod(self.obs_shape))
+        self.main_hard_role_mode = ram_mode in {"ppo_ram", "hard_role_q"}
+        if self.main_hard_role_mode:
+            if self.K != 2:
+                raise ValueError("PPO-RAM and HardRoleQ-RAM currently require K=2 roles")
+            if len(self.obs_shape) != 3 or self.obs_shape[0] != 3:
+                raise ValueError(
+                    f"{ram_mode} requires allocentric observations [3,H,W], got {self.obs_shape}"
+                )
+            if role_q_mixer not in {"none", "qmix"}:
+                raise ValueError("role_q_mixer must be one of: none, qmix")
+        self.per_beta_start, self.per_beta_end = float(per_beta_start), float(per_beta_end)
+        self.per_beta_progress = 0
+        self.hard_role_gamma = self.gamma if role_q_gamma is None else float(role_q_gamma)
+        self.ppo_rollout_macro_steps = int(ppo_rollout_macro_steps)
+        if self.main_hard_role_mode and ram_mode == "ppo_ram" and self.ppo_rollout_macro_steps <= 0:
+            raise ValueError("ppo_rollout_macro_steps must be positive")
 
         self._build_low_level(
             d_enc=d_enc,
@@ -352,14 +401,17 @@ class CTDERAMTrainer:
         # factored hard RAM avoids K**N outputs by producing N*K role values.
         # The soft_v2 mode is opt-in because it changes the executed policy from
         # one-hot roles to soft role/preference weights.
-        self.ROLE_COMBOS = list(itertools.product(range(self.K), repeat=self.N))
-        self.n_ram_actions = len(self.ROLE_COMBOS)
+        self.ROLE_COMBOS = (
+            [] if self.main_hard_role_mode
+            else list(itertools.product(range(self.K), repeat=self.N))
+        )
+        self.n_ram_actions = self.K ** self.N
         if ram_mode == "auto":
             self.ram_mode = "discrete" if self.n_ram_actions <= max_joint_role_actions else "factored"
         else:
             self.ram_mode = ram_mode
-        if self.ram_mode not in {"random", "discrete", "factored", "soft_v2"}:
-            raise ValueError("ram_mode must be one of: auto, random, discrete, factored, soft_v2")
+        if self.ram_mode not in {"ppo_ram", "hard_role_q", "random", "discrete", "factored", "soft_v2"}:
+            raise ValueError("invalid ram_mode")
         if self.global_agg_mode not in {"attention", "mean_pool"}:
             raise ValueError("global_agg_mode must be one of: attention, mean_pool")
         if self.soft_ram_arch not in {"mlp", "attention"}:
@@ -433,6 +485,32 @@ class CTDERAMTrainer:
 
         self.bufs_low = [LowLevelReplayBuffer(buf_low_cap, self.obs_shape) for _ in range(self.K)]
         self.buf_role = RoleReplayBuffer(buf_role_cap, self.N, self.d_enc, self.d_extra, self.K)
+
+        trunk_args = dict(
+            d_model=d_model, n_heads=n_attn_heads, n_layers=n_attn_layers,
+            ff_dim=attn_ff_dim, preference_role_bias=preference_role_bias,
+        )
+        self.ppo_actor = self.ppo_critic = self.ppo_learner = self.ppo_rollout = None
+        self.hard_role_q = self.hard_role_q_learner = self.hard_role_replay = None
+        if self.ram_mode == "ppo_ram":
+            self.ppo_actor = PPOActor(**trunk_args).to(self.device)
+            self.ppo_critic = PPOCritic(**trunk_args).to(self.device)
+            self.ppo_rollout = PPORoleRolloutBuffer()
+            self.ppo_learner = PPORAMLearner(
+                self.ppo_actor, self.ppo_critic, actor_lr, critic_lr, ppo_epochs,
+                ppo_minibatch_size, ppo_clip_eps, gae_lambda, entropy_coef,
+                value_coef, gamma, ppo_target_kl, ppo_max_grad_norm, self.device,
+            )
+        elif self.ram_mode == "hard_role_q":
+            self.hard_role_q = HardRoleQNetwork(**trunk_args).to(self.device)
+            self.hard_role_replay = PrioritizedHardRoleReplayBuffer(
+                buf_role_cap, self.N, self.obs_shape, per_alpha, per_eps
+            )
+            self.hard_role_q_learner = HardRoleQLearner(
+                self.hard_role_q, self.N, role_q_lr, role_q_target_update,
+                role_q_mixer, gamma if role_q_gamma is None else role_q_gamma,
+                per_eps, self.device,
+            )
 
         if not self.freeze_low_level:
             low_params = [p for p in self._low_level_parameters() if p.requires_grad]
@@ -554,7 +632,7 @@ class CTDERAMTrainer:
           - soft_v2 + attention: train RoleSelectorAttention, the scalable
             soft RAM from the final Elicit recommendation.
         """
-        if self.ram_mode == "random":
+        if self.ram_mode in {"random", "ppo_ram", "hard_role_q"}:
             return []
         params = list(self.global_agg.parameters())
         if self.ram_mode == "soft_v2" and self.soft_ram_arch == "attention":
@@ -1183,8 +1261,209 @@ class CTDERAMTrainer:
         self.tb.log_step("train/global_agg_grad_abs_sum", self.last_global_agg_grad_abs_sum)
         return lv
 
+    # ---------- main hard-role methods ----------
+    def _hard_role_state(self, obs_all, previous_roles, scal_weights):
+        maps = torch.as_tensor(np.stack(obs_all), dtype=torch.float32, device=self.device).unsqueeze(0)
+        previous = torch.as_tensor(previous_roles, dtype=torch.long, device=self.device).unsqueeze(0)
+        budget = torch.tensor([[self._env_value(self._active_env, "budget_frac", 1.0)]], dtype=torch.float32, device=self.device)
+        preference = torch.as_tensor(scal_weights, dtype=torch.float32, device=self.device).unsqueeze(0)
+        return maps, previous, budget, preference
+
+    @torch.no_grad()
+    def _select_main_hard_roles(self, obs_all, previous_roles, scal_weights, epsilon=0.0, training=True, return_attn=False):
+        maps, previous, budget, preference = self._hard_role_state(obs_all, previous_roles, scal_weights)
+        if self.ram_mode == "ppo_ram":
+            roles, logprob, probs, attn = self.ppo_actor.act(
+                maps, previous, budget, preference,
+                deterministic=not training, return_attn=return_attn,
+            )
+            value = self.ppo_critic(maps, previous, budget, preference)
+            logits = self.ppo_actor(maps, previous, budget, preference)
+            if not torch.isfinite(logits).all() or not torch.isfinite(value).all():
+                raise FloatingPointError("Non-finite PPO role logits or critic value")
+            return roles[0], {"logprob": logprob[0], "value": value[0], "scores": logits[0], "probs": probs[0], "attn": attn}
+
+        q_result = self.hard_role_q(maps, previous, budget, preference, return_attn=return_attn)
+        q, attn = q_result if return_attn else (q_result, None)
+        if training and self.rng.random() < epsilon:
+            roles = torch.as_tensor(self.rng.integers(0, 2, size=self.N), dtype=torch.long, device=self.device)
+        else:
+            roles = q[0].argmax(dim=-1)
+        return roles, {"scores": q[0], "probs": None, "attn": attn}
+
+    def _step_env_with_hard_roles(self, env, obs_all, roles: torch.Tensor, epsilon_low: float):
+        role_np = _tensor_to_numpy(roles, dtype=np.int64)
+        if self._env_uses_expert_nu(env):
+            obs_next, r_vecs, done, info = env.step(role_np)
+            return obs_next, r_vecs, done, info, None
+        actions = []
+        for i in range(self.N):
+            if self.rng.random() < epsilon_low:
+                actions.append(int(self.rng.integers(0, self.A)))
+                continue
+            obs_t = torch.as_tensor(obs_all[i], dtype=torch.float32, device=self.device).unsqueeze(0)
+            q = self._q_role(obs_t, int(role_np[i])).squeeze(0)
+            actions.append(int(q.argmax().item()))
+        obs_next, r_vecs, done, info = env.step(actions)
+        return obs_next, r_vecs, done, info, actions
+
+    def _per_beta(self):
+        # Smooth annealing by successful learner updates; capped at beta_end.
+        fraction = min(self.per_beta_progress / 100_000.0, 1.0)
+        return self.per_beta_start + fraction * (self.per_beta_end - self.per_beta_start)
+
+    def _run_hard_role_episode(self, env, scal_weights, epsilon_low, epsilon_ram, training=True, attention_records=None, seed=None):
+        self._active_env = env
+        if not self._env_uses_expert_nu(env):
+            raise ValueError(
+                f"{self.ram_mode} requires --project-control expert_nu so branch selection, "
+                "map masking, and fleet-consensus masking remain inside the low-level controller"
+            )
+        scal_weights = np.asarray(scal_weights, dtype=np.float32)
+        scal_weights /= max(float(scal_weights.sum()), 1e-8)
+        obs_all, done, ep_step = env.reset(seed=seed), False, 0
+        previous_roles = np.zeros(self.N, dtype=np.int64)
+        total_reward, switches = 0.0, 0
+        role_counts = np.zeros(2, dtype=np.float64)
+        score_sums = np.zeros(2, dtype=np.float64)
+        prob_sums = np.zeros(2, dtype=np.float64)
+        decisions = 0
+        losses = []
+        raw_reward_sum = np.zeros(self.K, dtype=np.float64)
+        norm_reward_sum = np.zeros(self.K, dtype=np.float64)
+        scalar_reward_sum = 0.0
+        reward_steps = 0
+
+        while not done:
+            start_obs = np.asarray(obs_all, dtype=np.float32)
+            start_prev = previous_roles.copy()
+            start_budget = self._env_value(env, "budget_frac", 1.0)
+            roles, policy_info = self._select_main_hard_roles(
+                obs_all, previous_roles, scal_weights, epsilon_ram,
+                training=training, return_attn=attention_records is not None,
+            )
+            roles_np = _tensor_to_numpy(roles, dtype=np.int64)
+            if decisions and not np.array_equal(roles_np, previous_roles):
+                switches += 1
+            role_counts += np.bincount(roles_np, minlength=2)
+            score_sums += _tensor_to_numpy(policy_info["scores"], dtype=np.float32).mean(axis=0)
+            if policy_info["probs"] is not None:
+                prob_sums += _tensor_to_numpy(policy_info["probs"], dtype=np.float32).mean(axis=0)
+            if attention_records is not None:
+                attention_records.append({
+                    "attention": np.stack([_tensor_to_numpy(a[0]) for a in policy_info["attn"]]),
+                    "roles": roles_np.copy(), "preference": scal_weights.copy(),
+                    "budget": start_budget, "step": ep_step, "macro_step": decisions,
+                })
+
+            macro_reward, duration = 0.0, 0
+            while duration < self.T_role and not done:
+                obs_next, r_vecs, done, info, _ = self._step_env_with_hard_roles(
+                    env, obs_all, roles, epsilon_low if training else 0.0
+                )
+                fleet_components = self._stack_rewards(r_vecs).sum(dim=0)
+                # Normalize objective components before nonlinear scalarization.
+                # In particular, EWC/WPOP are designed for calibrated,
+                # non-negative inputs; the default min-max normalizer maps the
+                # project reward components to [0,1] before scalarization.
+                # Scalarize each environment reward first, then discount it by
+                # its offset inside this SMDP macro action.
+                scalar_step = self._scalarize_role_reward(
+                    fleet_components,
+                    torch.as_tensor(scal_weights, dtype=torch.float32, device=self.device),
+                    update_norm=training,
+                )
+                raw_np = _tensor_to_numpy(fleet_components, dtype=np.float32)
+                if self.role_reward_norm_name == "minmax":
+                    normalized_components = self.role_reward_norm.normalize_tensor(fleet_components)
+                else:
+                    normalized_components = fleet_components
+                raw_reward_sum += raw_np
+                norm_reward_sum += _tensor_to_numpy(normalized_components, dtype=np.float32)
+                scalar_reward_sum += float(scalar_step.item())
+                reward_steps += 1
+                macro_gamma = self.hard_role_gamma if self.ram_mode == "hard_role_q" else self.gamma
+                macro_reward += (macro_gamma ** duration) * float(scalar_step.item())
+                obs_all = obs_next
+                duration += 1
+                ep_step += 1
+
+            next_obs = np.asarray(obs_all, dtype=np.float32)
+            next_budget = self._env_value(env, "budget_frac", 1.0)
+            if training and self.ram_mode == "ppo_ram":
+                self.ppo_rollout.store(
+                    maps=start_obs, preference=scal_weights, previous_roles=start_prev,
+                    roles=roles_np, old_logprob=float(policy_info["logprob"].item()),
+                    value=float(policy_info["value"].item()), reward=macro_reward,
+                    done=float(done), duration=float(duration), budget=[start_budget],
+                    next_maps=next_obs, next_previous_roles=roles_np,
+                    next_budget=[next_budget],
+                )
+            elif training:
+                self.hard_role_replay.store(
+                    start_obs, scal_weights, start_prev, roles_np, macro_reward,
+                    next_obs, roles_np, done, duration, [start_budget], [next_budget],
+                )
+                update = self.hard_role_q_learner.update(self.hard_role_replay, self.batch_role, self._per_beta())
+                if update is not None:
+                    losses.append(update[0])
+                    self.per_beta_progress += 1
+            previous_roles = roles_np
+            total_reward += macro_reward
+            decisions += 1
+
+        if (
+            training and self.ram_mode == "ppo_ram"
+            and len(self.ppo_rollout) >= self.ppo_rollout_macro_steps
+        ):
+            update = self.ppo_learner.update(self.ppo_rollout)
+            if update is not None:
+                losses.append(update.loss)
+                self.tb.log_step("train/ppo_policy_loss", update.policy_loss)
+                self.tb.log_step("train/ppo_value_loss", update.value_loss)
+                self.tb.log_step("train/ppo_entropy", update.entropy)
+                self.tb.log_step("train/ppo_approx_kl", update.approx_kl)
+                self.tb.log_step("train/ppo_epochs_ran", update.epochs_ran)
+
+        denom = max(float(role_counts.sum()), 1.0)
+        metrics = {
+            "total_reward": total_reward, "n_steps": ep_step, "n_switches": switches,
+            "switch_rate": switches / max(decisions - 1, 1), "role_decisions": decisions,
+            "final_coverage": self._env_value(env, "coverage_pct", 0.0),
+            "final_trash_cleaned": self._env_value(env, "trash_cleaned_pct", 0.0),
+            "head_losses": [], "ram_losses": losses,
+            "role0_frac": float(role_counts[0] / denom), "role1_frac": float(role_counts[1] / denom),
+            "mean_role0_score": float(score_sums[0] / max(decisions, 1)),
+            "mean_role1_score": float(score_sums[1] / max(decisions, 1)),
+            "mean_role0_probability": float(prob_sums[0] / max(decisions, 1)) if self.ram_mode == "ppo_ram" else float("nan"),
+            "mean_role1_probability": float(prob_sums[1] / max(decisions, 1)) if self.ram_mode == "ppo_ram" else float("nan"),
+            "epsilon_low": float(epsilon_low), "epsilon_ram": float(epsilon_ram),
+            "ppo_rollout_size": int(len(self.ppo_rollout)) if self.ppo_rollout is not None else 0,
+        }
+        for k in range(self.K):
+            metrics[f"raw_reward_component{k}"] = float(raw_reward_sum[k] / max(reward_steps, 1))
+            metrics[f"norm_reward_component{k}"] = float(norm_reward_sum[k] / max(reward_steps, 1))
+        metrics["mean_scalarized_reward"] = float(scalar_reward_sum / max(reward_steps, 1))
+        if training:
+            self.tb.log_episode_metrics(metrics, prefix="train")
+        return metrics
+
+    def flush_main_method_updates(self):
+        """Train on a final partial PPO rollout before final evaluation/checkpointing."""
+        if self.ram_mode != "ppo_ram" or self.ppo_rollout is None or len(self.ppo_rollout) == 0:
+            return None
+        update = self.ppo_learner.update(self.ppo_rollout)
+        if update is not None:
+            self.tb.log_step("train/ppo_policy_loss", update.policy_loss)
+            self.tb.log_step("train/ppo_value_loss", update.value_loss)
+            self.tb.log_step("train/ppo_entropy", update.entropy)
+            self.tb.log_step("train/ppo_approx_kl", update.approx_kl)
+        return update
+
     # ---------- one training episode ----------
     def run_episode(self, env, scal_weights, epsilon_low: float, epsilon_ram: float):
+        if self.main_hard_role_mode:
+            return self._run_hard_role_episode(env, scal_weights, epsilon_low, epsilon_ram, training=True)
         scal_weights = np.asarray(scal_weights, dtype=np.float32)
         scal_weights = scal_weights / max(float(scal_weights.sum()), 1e-8)
         sw_t = torch.as_tensor(scal_weights, dtype=torch.float32, device=self.device)
@@ -1403,6 +1682,90 @@ class CTDERAMTrainer:
         self.rng = np.random.default_rng(seed)
         return env.reset(seed=seed)
 
+    @torch.no_grad()
+    def diagnose_same_state_preferences(self, env, seed: Optional[int] = None):
+        """Compare role outputs for extreme preferences on the exact same state."""
+        if not self.main_hard_role_mode:
+            return None
+        self._active_env = env
+        obs = env.reset(seed=self.seed if seed is None else int(seed))
+        previous = np.zeros(self.N, dtype=np.int64)
+        outputs = []
+        for preference in ((1.0, 0.0), (0.0, 1.0)):
+            roles, info = self._select_main_hard_roles(
+                obs, previous, preference, epsilon=0.0,
+                training=False, return_attn=False,
+            )
+            outputs.append({
+                "preference": list(preference),
+                "roles": _tensor_to_numpy(roles, dtype=np.int64).tolist(),
+                "scores": _tensor_to_numpy(info["scores"], dtype=np.float32).tolist(),
+                "probabilities": None if info["probs"] is None else _tensor_to_numpy(info["probs"], dtype=np.float32).tolist(),
+            })
+        score0 = np.asarray(outputs[0]["scores"], dtype=np.float32)
+        score1 = np.asarray(outputs[1]["scores"], dtype=np.float32)
+        return {
+            "extremes": outputs,
+            "mean_abs_score_difference": float(np.abs(score0 - score1).mean()),
+            "max_abs_score_difference": float(np.abs(score0 - score1).max()),
+            "roles_differ": outputs[0]["roles"] != outputs[1]["roles"],
+        }
+
+    @torch.no_grad()
+    def evaluate_forced_role_policies(self, env, n_episodes: int = 5, seed_base: Optional[int] = None):
+        """Evaluate fixed role allocations using paired seeds, independent of RAM."""
+        if not self.main_hard_role_mode:
+            return []
+        if not self._env_uses_expert_nu(env):
+            raise ValueError("forced-role diagnostics require the Expert_nu adapter")
+        seed_base = self.seed if seed_base is None else int(seed_base)
+        policies = ("all_clean", "all_explore", "split", "alternating", "random")
+        rows = []
+        for policy in policies:
+            episode_metrics = []
+            for episode_i in range(int(n_episodes)):
+                obs = env.reset(seed=seed_base + episode_i)
+                rng = np.random.default_rng(seed_base + episode_i)
+                done, macro_i, steps = False, 0, 0
+                component_return = np.zeros(self.K, dtype=np.float64)
+                switches, previous = 0, None
+                while not done:
+                    if policy == "all_clean":
+                        roles_np = np.zeros(self.N, dtype=np.int64)
+                    elif policy == "all_explore":
+                        roles_np = np.ones(self.N, dtype=np.int64)
+                    elif policy == "split":
+                        roles_np = np.arange(self.N, dtype=np.int64) >= max(self.N // 2, 1)
+                        roles_np = roles_np.astype(np.int64)
+                    elif policy == "alternating":
+                        roles_np = np.full(self.N, macro_i % 2, dtype=np.int64)
+                    else:
+                        roles_np = rng.integers(0, 2, size=self.N, dtype=np.int64)
+                    if previous is not None and not np.array_equal(previous, roles_np):
+                        switches += 1
+                    previous = roles_np.copy()
+                    roles = torch.as_tensor(roles_np, dtype=torch.long, device=self.device)
+                    duration = 0
+                    while duration < self.T_role and not done:
+                        obs, rewards, done, _, _ = self._step_env_with_hard_roles(env, obs, roles, 0.0)
+                        component_return += _tensor_to_numpy(self._stack_rewards(rewards).sum(dim=0))
+                        duration += 1
+                        steps += 1
+                    macro_i += 1
+                episode_metrics.append({
+                    "coverage": self._env_value(env, "coverage_pct", 0.0),
+                    "trash_cleaned": self._env_value(env, "trash_cleaned_pct", 0.0),
+                    "clean_reward_return": float(component_return[0]),
+                    "explore_reward_return": float(component_return[1]),
+                    "switches": switches,
+                    "steps": steps,
+                })
+            row = {"forced_policy": policy, "episodes": int(n_episodes)}
+            for key in episode_metrics[0]:
+                row[key] = float(np.mean([item[key] for item in episode_metrics]))
+            rows.append(row)
+        return rows
+
     def _evaluate_single(
         self,
         env,
@@ -1412,6 +1775,27 @@ class CTDERAMTrainer:
         progress_desc: Optional[str] = None,
         episode_seeds=None,
     ):
+        if self.main_hard_role_mode:
+            if episode_seeds is None:
+                episode_seeds = [self.seed + i for i in range(n_episodes)]
+            rows, role_counts = [], np.zeros(2, dtype=np.int64)
+            for episode_i in range(n_episodes):
+                row = self._run_hard_role_episode(
+                    env, scal_weights, 0.0, 0.0, training=False,
+                    seed=int(episode_seeds[episode_i]),
+                )
+                role_counts += np.asarray([
+                    round(row["role0_frac"] * row["role_decisions"] * self.N),
+                    round(row["role1_frac"] * row["role_decisions"] * self.N),
+                ], dtype=np.int64)
+                rows.append({
+                    "coverage": row["final_coverage"],
+                    "trash_cleaned": row["final_trash_cleaned"],
+                    "n_switches": row["n_switches"],
+                })
+            avg = {key: float(np.mean([row[key] for row in rows])) for key in rows[0]}
+            avg["_role_counts"] = role_counts
+            return avg
         scal_weights = np.asarray(scal_weights, dtype=np.float32)
         scal_weights = scal_weights / max(float(scal_weights.sum()), 1e-8)
         results = []
@@ -1530,6 +1914,7 @@ class CTDERAMTrainer:
         plot_path: Optional[str] = None,
         pareto_plot_path: Optional[str] = None,
         episode_seed_base: Optional[int] = None,
+        attention_path: Optional[str] = None,
     ):
         """Sweep preference weights and report whether the selected roles move.
 
@@ -1543,6 +1928,56 @@ class CTDERAMTrainer:
         """
         if scal_grid is None:
             scal_grid = [(1.0, 0.0), (0.75, 0.25), (0.5, 0.5), (0.25, 0.75), (0.0, 1.0)]
+
+        if self.main_hard_role_mode:
+            rows, attention_records = [], []
+            seed_base = self.seed if episode_seed_base is None else int(episode_seed_base)
+            for scal_weights in scal_grid:
+                episode_rows = []
+                for episode_i in range(int(n_episodes_per_w)):
+                    records = attention_records if episode_i == 0 else None
+                    episode_rows.append(self._run_hard_role_episode(
+                        env, scal_weights, 0.0, 0.0, training=False,
+                        attention_records=records, seed=seed_base + episode_i,
+                    ))
+                row = {
+                    "w0": float(scal_weights[0]), "w1": float(scal_weights[1]),
+                    "role0_argmax_frac": float(np.mean([x["role0_frac"] for x in episode_rows])),
+                    "role1_argmax_frac": float(np.mean([x["role1_frac"] for x in episode_rows])),
+                    "mean_clean_logit_or_q": float(np.mean([x["mean_role0_score"] for x in episode_rows])),
+                    "mean_explore_logit_or_q": float(np.mean([x["mean_role1_score"] for x in episode_rows])),
+                    "mean_p_clean": float(np.nanmean([x["mean_role0_probability"] for x in episode_rows])) if self.ram_mode == "ppo_ram" else float("nan"),
+                    "mean_p_explore": float(np.nanmean([x["mean_role1_probability"] for x in episode_rows])) if self.ram_mode == "ppo_ram" else float("nan"),
+                    "coverage": float(np.mean([x["final_coverage"] for x in episode_rows])),
+                    "trash_cleaned": float(np.mean([x["final_trash_cleaned"] for x in episode_rows])),
+                    "switch_rate": float(np.mean([x["switch_rate"] for x in episode_rows])),
+                    "episode_return": float(np.mean([x["total_reward"] for x in episode_rows])),
+                }
+                rows.append(row)
+            if save_csv:
+                os.makedirs(os.path.dirname(save_csv) or ".", exist_ok=True)
+                with open(save_csv, "w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                    writer.writeheader()
+                    writer.writerows(rows)
+            if attention_path:
+                os.makedirs(os.path.dirname(attention_path) or ".", exist_ok=True)
+                np.savez_compressed(
+                    attention_path,
+                    attention=np.asarray([x["attention"] for x in attention_records]),
+                    roles=np.asarray([x["roles"] for x in attention_records]),
+                    preference=np.asarray([x["preference"] for x in attention_records]),
+                    budget=np.asarray([x["budget"] for x in attention_records]),
+                    step=np.asarray([x["step"] for x in attention_records]),
+                    macro_step=np.asarray([x["macro_step"] for x in attention_records]),
+                )
+            for row in rows:
+                _progress_write(
+                    f"[probe] w=({row['w0']:.2f},{row['w1']:.2f}) "
+                    f"clean={row['role0_argmax_frac']:.3f} explore={row['role1_argmax_frac']:.3f} "
+                    f"coverage={row['coverage']:.3f} cleaned={row['trash_cleaned']:.3f}"
+                )
+            return rows
 
         rows = []
         rng_state = self._capture_evaluation_rng_state()
@@ -1846,6 +2281,11 @@ class CTDERAMTrainer:
             optim_state["low"] = self.optim_low.state_dict()
         if self.optim_ram is not None:
             optim_state["ram"] = self.optim_ram.state_dict()
+        if self.ppo_learner is not None:
+            optim_state["ppo_actor"] = self.ppo_learner.actor_optim.state_dict()
+            optim_state["ppo_critic"] = self.ppo_learner.critic_optim.state_dict()
+        if self.hard_role_q_learner is not None:
+            optim_state["hard_role_q"] = self.hard_role_q_learner.optim.state_dict()
         return {
             "format": "ctde_ram_checkpoint_v1",
             "episode": episode,
@@ -1901,6 +2341,12 @@ class CTDERAMTrainer:
                 "ram_mixer": None if self.ram_mixer is None else self.ram_mixer.state_dict(),
                 "ram_mixer_tgt": None if self.ram_mixer_tgt is None else self.ram_mixer_tgt.state_dict(),
                 "low_level": self._low_level_state(),
+                "ppo_actor": None if self.ppo_actor is None else self.ppo_actor.state_dict(),
+                "ppo_critic": None if self.ppo_critic is None else self.ppo_critic.state_dict(),
+                "hard_role_q": None if self.hard_role_q is None else self.hard_role_q.state_dict(),
+                "hard_role_q_target": None if self.hard_role_q_learner is None else self.hard_role_q_learner.target.state_dict(),
+                "hard_role_q_mixer": None if self.hard_role_q_learner is None or self.hard_role_q_learner.mixer is None else self.hard_role_q_learner.mixer.state_dict(),
+                "hard_role_q_target_mixer": None if self.hard_role_q_learner is None or self.hard_role_q_learner.target_mixer is None else self.hard_role_q_learner.target_mixer.state_dict(),
             },
             "normalizers": {
                 "popart": self._popart_state(),
@@ -1912,6 +2358,8 @@ class CTDERAMTrainer:
             },
             "replay_buffers": {
                 "role": self.buf_role.state_dict(),
+                "hard_role": None if self.hard_role_replay is None else self.hard_role_replay.state_dict(),
+                "ppo_rollout": None if self.ppo_rollout is None else self.ppo_rollout.state_dict(),
             },
             "optimizers": optim_state,
         }
@@ -1936,12 +2384,25 @@ class CTDERAMTrainer:
             self.ram_mixer.load_state_dict(models["ram_mixer"])
             self.ram_mixer_tgt.load_state_dict(models.get("ram_mixer_tgt", models["ram_mixer"]))
         self._load_low_level_state(models.get("low_level"))
+        if self.ppo_actor is not None and models.get("ppo_actor") is not None:
+            self.ppo_actor.load_state_dict(models["ppo_actor"])
+            self.ppo_critic.load_state_dict(models["ppo_critic"])
+        if self.hard_role_q is not None and models.get("hard_role_q") is not None:
+            self.hard_role_q.load_state_dict(models["hard_role_q"])
+            self.hard_role_q_learner.target.load_state_dict(models.get("hard_role_q_target", models["hard_role_q"]))
+            if self.hard_role_q_learner.mixer is not None and models.get("hard_role_q_mixer") is not None:
+                self.hard_role_q_learner.mixer.load_state_dict(models["hard_role_q_mixer"])
+                self.hard_role_q_learner.target_mixer.load_state_dict(models.get("hard_role_q_target_mixer", models["hard_role_q_mixer"]))
         self._load_popart_state(ckpt.get("normalizers", {}).get("popart"))
         self._load_role_reward_norm_state(ckpt.get("normalizers", {}).get("role_reward"))
         switch_scale = ckpt.get("normalizers", {}).get("switch_penalty_reward_scale", {})
         self.role_reward_abs_mean = float(switch_scale.get("abs_mean", self.role_reward_abs_mean))
         self.role_reward_abs_count = int(switch_scale.get("count", self.role_reward_abs_count))
         self.buf_role.load_state_dict(ckpt.get("replay_buffers", {}).get("role"))
+        if self.hard_role_replay is not None:
+            self.hard_role_replay.load_state_dict(ckpt.get("replay_buffers", {}).get("hard_role"))
+        if self.ppo_rollout is not None:
+            self.ppo_rollout.load_state_dict(ckpt.get("replay_buffers", {}).get("ppo_rollout"))
 
         steps = ckpt.get("steps", {})
         self.step_count_low = int(steps.get("low", self.step_count_low))
@@ -1952,6 +2413,13 @@ class CTDERAMTrainer:
                 self.optim_low.load_state_dict(optimizers["low"])
             if self.optim_ram is not None and "ram" in optimizers:
                 self.optim_ram.load_state_dict(optimizers["ram"])
+            if self.ppo_learner is not None:
+                if "ppo_actor" in optimizers:
+                    self.ppo_learner.actor_optim.load_state_dict(optimizers["ppo_actor"])
+                if "ppo_critic" in optimizers:
+                    self.ppo_learner.critic_optim.load_state_dict(optimizers["ppo_critic"])
+            if self.hard_role_q_learner is not None and "hard_role_q" in optimizers:
+                self.hard_role_q_learner.optim.load_state_dict(optimizers["hard_role_q"])
         return ckpt
 
     def close(self):

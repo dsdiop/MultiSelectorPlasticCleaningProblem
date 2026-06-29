@@ -229,6 +229,14 @@ class ProjectPatrollingExpertNuCTDEEnv(ProjectPatrollingCTDEEnv):
             nu = arr
         return np.clip(nu.astype(np.float32), 0.0, 1.0)
 
+    def _hard_roles_to_condition(self, roles) -> np.ndarray:
+        roles = np.asarray(roles)
+        if roles.shape != (self.N,):
+            raise ValueError(f"Expected hard roles [{self.N}], got {roles.shape}")
+        if not np.all((roles == 0) | (roles == 1)):
+            raise ValueError("Hard roles must be integer clean=0/explore=1")
+        return roles.astype(bool)
+
     def reset(self, seed=None):
         if seed is not None:
             self.rng = np.random.default_rng(int(seed))
@@ -246,14 +254,17 @@ class ProjectPatrollingExpertNuCTDEEnv(ProjectPatrollingCTDEEnv):
             out[agent_id] = obs
         return out
 
-    def _nu_to_actions(self, nu: np.ndarray) -> dict[int, int]:
+    def _nu_to_actions(self, nu: np.ndarray, hard_roles=None) -> dict[int, int]:
         active_ids = self._active_ids()
         condition = np.zeros(self.N, dtype=bool)
         # Same semantics as MultiAgentNuWrapper:
         #   nu=0 -> condition False -> cleaning head
         #   nu=1 -> condition True  -> exploration head
         #   soft nu in [0,1] samples exploration with probability nu.
-        condition[: len(nu)] = nu > self.rng.random(len(nu))
+        condition[: len(nu)] = (
+            self._hard_roles_to_condition(hard_roles)
+            if hard_roles is not None else nu > self.rng.random(len(nu))
+        )
         state_float32 = self._state_float32(active_ids)
         if not self.expert_nu.masked_actions:
             actions = self.expert_nu.select_action(state_float32, condition=condition)
@@ -266,8 +277,10 @@ class ProjectPatrollingExpertNuCTDEEnv(ProjectPatrollingCTDEEnv):
         return {agent_id: int(action) for agent_id, action in actions.items() if agent_id in active_ids}
 
     def step(self, role_weights):
+        raw = np.asarray(role_weights)
+        hard_roles = raw if raw.ndim == 1 and np.issubdtype(raw.dtype, np.integer) else None
         nu = self._role_weights_to_nu(role_weights)
-        action_dict = self._nu_to_actions(nu)
+        action_dict = self._nu_to_actions(nu, hard_roles=hard_roles)
         obs, reward, done_dict, info = self.env.step(action_dict)
         # MultiAgentNuWrapper used any(done.values()). Keep that behavior here
         # because this mode is meant to reproduce the old make_env substrate.

@@ -28,10 +28,19 @@ def ensure_dir(path: str) -> str:
 def make_run_name(args) -> str:
     if getattr(args, "run_name", None):
         return str(args.run_name)
+    mode = str(getattr(args, "ram_mode", "ram"))
+    main_names = {
+        "ppo_ram": "PPO_RAM_FiLM_Attn",
+        "hard_role_q": (
+            "HardRoleQ_RAM_FiLM_Attn_QMIX"
+            if getattr(args, "role_q_mixer", "none") == "qmix"
+            else "HardRoleQ_RAM_FiLM_Attn"
+        ),
+    }
     parts = [
         "ctde_ram",
         str(getattr(args, "env", "env")),
-        str(getattr(args, "ram_mode", "ram")),
+        main_names.get(mode, f"legacy_{mode}"),
         str(getattr(args, "soft_ram_arch", "arch")),
         str(getattr(args, "role_scalarization", "ws")),
         str(getattr(args, "q_scalarization", "ws")),

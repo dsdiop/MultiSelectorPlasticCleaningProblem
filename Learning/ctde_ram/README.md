@@ -1,9 +1,28 @@
 # CTDE-RAM for MultiSelector Plastic Cleaning
 
-This package implements a two-timescale hierarchical CTDE method:
+> **Current main methodology:** `PPO_RAM_FiLM_Attn`,
+> `HardRoleQ_RAM_FiLM_Attn`, and optional-QMIX
+> `HardRoleQ_RAM_FiLM_Attn_QMIX`. These methods emit and replay one hard
+> clean/explore role per ASV. The older `soft_v2`/SAttn variants below are
+> retained only as **legacy soft-learning / hard-execution RAM** and are not
+> part of the main experiment table.
 
-- **High level RAM**: chooses role/preference weights for the fleet every `T_role` steps.
-- **Low level DQN**: chooses each ASV navigation action using the selected role weights.
+```bash
+python -m Learning.ctde_ram.run_experiment --env project --project-control expert_nu \
+  --path-planner-folder <folder> --ram-mode ppo_ram
+python -m Learning.ctde_ram.run_experiment --env project --project-control expert_nu \
+  --path-planner-folder <folder> --ram-mode hard_role_q --role-q-mixer none
+python -m Learning.ctde_ram.run_experiment --env project --project-control expert_nu \
+  --path-planner-folder <folder> --ram-mode hard_role_q --role-q-mixer qmix
+```
+
+The remaining text documents historical compatibility modes as well as current utilities.
+
+This package implements two main two-timescale hard-role CTDE methods. Historical
+soft-weight modes remain available only for reproducibility:
+
+- **High level RAM**: chooses one hard role per ASV every `T_role` steps.
+- **Low level controller**: receives that role as its branch condition, then chooses movement.
 - **Role semantics in this project**:
   - `role 0 = nu=0 = cleaning / intensification`
   - `role 1 = nu=1 = exploration / coverage`
@@ -71,7 +90,7 @@ action_i = argmax_a Q_comp_i(a)
 ```
 
 - Training: a soft Double-DQN-style backup. The online RAM chooses `W_next` with softmax; the target RAM evaluates that same soft `W_next`.
-- Best for: the final Elicit direction and the paper claim around learned soft preference/role weights.
+- Status: legacy soft-learning / hard-execution research path; not a current main method.
 
 Choose the soft RAM network with `--soft-ram-arch`:
 
@@ -91,8 +110,8 @@ Use `--global-agg` to choose how the centralized fleet context `g` is built befo
 Elicit-style relational aggregation.
 
 - Each agent encoding can attend to the other agents before pooling.
-- This is the default and the main method.
-- Use this when reporting the scalable relational RAM result.
+- This was the default relational aggregator for the legacy RAM modes.
+- The new hard-role methods use their own residual attention trunk.
 
 ### `--global-agg mean_pool`
 

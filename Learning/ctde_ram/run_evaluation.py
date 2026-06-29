@@ -36,6 +36,7 @@ def parse_args():
     )
     p.add_argument("--probe", action="store_true", help="Also run the preference-sensitivity probe.")
     p.add_argument("--probe-episodes", type=int, default=3)
+    p.add_argument("--attention-output", type=str, default=None, help="Optional .npz for hard-role attention traces.")
     return p.parse_args()
 
 
@@ -182,6 +183,7 @@ def main():
             save_csv=os.path.join(out_dir, "preference_probe.csv"),
             plot_path=os.path.join(out_dir, "preference_probe.png"),
             pareto_plot_path=os.path.join(out_dir, "preference_probe.pareto.png"),
+            attention_path=eval_args.attention_output or os.path.join(out_dir, "hard_role_attention.npz"),
         )
 
     trainer.close()

@@ -162,3 +162,129 @@ class RoleReplayBuffer:
         if components is not None:
             self._ensure_component_storage(components)
             self.r_components[:n] = np.asarray(components)[:n]
+
+
+class PPORoleRolloutBuffer:
+    """On-policy macro transitions; actions are executed integer roles [N]."""
+
+    FIELDS = (
+        "maps", "preference", "previous_roles", "roles", "old_logprob", "value",
+        "reward", "done", "duration", "budget", "next_maps",
+        "next_previous_roles", "next_budget",
+    )
+
+    def __init__(self):
+        self.clear()
+
+    def __len__(self):
+        return len(self.data["reward"])
+
+    def clear(self):
+        self.data = {name: [] for name in self.FIELDS}
+
+    def store(self, **transition):
+        missing = set(self.FIELDS) - set(transition)
+        if missing:
+            raise ValueError(f"Missing PPO rollout fields: {sorted(missing)}")
+        for name in self.FIELDS:
+            self.data[name].append(np.asarray(transition[name]).copy())
+
+    def as_tensors(self, device="cpu"):
+        integer = {"previous_roles", "roles", "next_previous_roles"}
+        out = {}
+        for name, values in self.data.items():
+            dtype = torch.long if name in integer else torch.float32
+            out[name] = torch.as_tensor(np.asarray(values), dtype=dtype, device=device)
+        return out
+
+    def state_dict(self):
+        return {name: [np.asarray(value).copy() for value in values] for name, values in self.data.items()}
+
+    def load_state_dict(self, state):
+        self.clear()
+        if not state:
+            return
+        for name in self.FIELDS:
+            self.data[name] = [np.asarray(value).copy() for value in state.get(name, [])]
+
+
+class PrioritizedHardRoleReplayBuffer:
+    """Proportional PER for hard macro role assignments."""
+
+    def __init__(self, capacity: int, n_agents: int, obs_shape, alpha=0.6, eps=1e-6):
+        if len(tuple(obs_shape)) != 3 or int(tuple(obs_shape)[0]) != 3:
+            raise ValueError("Hard-role replay requires observation shape [3,H,W]")
+        self.capacity, self.n_agents = int(capacity), int(n_agents)
+        self.obs_shape, self.alpha, self.eps = tuple(obs_shape), float(alpha), float(eps)
+        shape = (self.capacity, self.n_agents, *self.obs_shape)
+        self.maps = np.zeros(shape, dtype=np.float32)
+        self.next_maps = np.zeros(shape, dtype=np.float32)
+        self.preference = np.zeros((self.capacity, 2), dtype=np.float32)
+        self.previous_roles = np.zeros((self.capacity, self.n_agents), dtype=np.int64)
+        self.roles = np.zeros((self.capacity, self.n_agents), dtype=np.int64)
+        self.next_previous_roles = np.zeros((self.capacity, self.n_agents), dtype=np.int64)
+        self.budget = np.zeros((self.capacity, 1), dtype=np.float32)
+        self.next_budget = np.zeros((self.capacity, 1), dtype=np.float32)
+        self.rewards = np.zeros(self.capacity, dtype=np.float32)
+        self.dones = np.zeros(self.capacity, dtype=np.float32)
+        self.durations = np.ones(self.capacity, dtype=np.float32)
+        self.priorities = np.zeros(self.capacity, dtype=np.float32)
+        self.ptr = self.size = 0
+
+    def store(
+        self, maps, preference, previous_roles, roles, reward, next_maps,
+        next_previous_roles, done, duration, budget, next_budget,
+    ):
+        i = self.ptr % self.capacity
+        self.maps[i], self.next_maps[i] = maps, next_maps
+        self.preference[i] = preference
+        self.previous_roles[i], self.roles[i] = previous_roles, roles
+        self.next_previous_roles[i] = next_previous_roles
+        self.rewards[i], self.dones[i], self.durations[i] = reward, done, duration
+        self.budget[i], self.next_budget[i] = budget, next_budget
+        self.priorities[i] = self.priorities[:self.size].max() if self.size else 1.0
+        self.ptr += 1
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size: int, beta: float, device="cpu"):
+        scaled = np.maximum(self.priorities[:self.size], self.eps) ** self.alpha
+        probs = scaled / scaled.sum()
+        indices = np.random.choice(self.size, size=batch_size, replace=True, p=probs)
+        weights = (self.size * probs[indices]) ** (-float(beta))
+        weights /= weights.max()
+        float_fields = {
+            "maps": self.maps[indices], "next_maps": self.next_maps[indices],
+            "preference": self.preference[indices], "budget": self.budget[indices],
+            "next_budget": self.next_budget[indices], "reward": self.rewards[indices],
+            "done": self.dones[indices], "duration": self.durations[indices],
+            "weights": weights.astype(np.float32),
+        }
+        out = {name: torch.as_tensor(value, dtype=torch.float32, device=device) for name, value in float_fields.items()}
+        for name, value in {
+            "previous_roles": self.previous_roles[indices], "roles": self.roles[indices],
+            "next_previous_roles": self.next_previous_roles[indices],
+        }.items():
+            out[name] = torch.as_tensor(value, dtype=torch.long, device=device)
+        out["indices"] = indices
+        return out
+
+    def update_priorities(self, indices, priorities):
+        for i, priority in zip(indices, priorities):
+            self.priorities[int(i)] = max(float(priority), self.eps)
+
+    def state_dict(self):
+        return {name: getattr(self, name).copy() for name in (
+            "maps", "next_maps", "preference", "previous_roles", "roles",
+            "next_previous_roles", "budget", "next_budget", "rewards", "dones",
+            "durations", "priorities",
+        )} | {"ptr": self.ptr, "size": self.size}
+
+    def load_state_dict(self, state):
+        if not state:
+            return
+        self.ptr, self.size = int(state.get("ptr", 0)), min(int(state.get("size", 0)), self.capacity)
+        for name in self.state_dict():
+            if name in {"ptr", "size"} or name not in state:
+                continue
+            target = getattr(self, name)
+            target[:self.size] = np.asarray(state[name])[:self.size]
