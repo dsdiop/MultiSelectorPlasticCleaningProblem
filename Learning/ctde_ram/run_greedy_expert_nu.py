@@ -115,7 +115,12 @@ def parse_args(argv=None):
 
     # Existing project-environment defaults.
     parser.add_argument("--distance-budget", type=int, default=100)
-    parser.add_argument("--dynamic", action="store_true")
+    parser.add_argument(
+        "--dynamic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable dynamic ground-truth evolution (default: enabled; use --no-dynamic to disable).",
+    )
     parser.add_argument("--no-miopic", dest="miopic", action="store_false")
     parser.set_defaults(miopic=True)
     parser.add_argument("--detection-length", type=int, default=2)

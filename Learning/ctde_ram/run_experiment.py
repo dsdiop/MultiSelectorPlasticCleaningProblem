@@ -376,7 +376,12 @@ def parse_args(argv=None):
     p.add_argument("--initial-positions", type=str, default=None)
     p.add_argument("--distance-budget", type=int, default=100)
     p.add_argument("--n-agents", type=int, default=None)
-    p.add_argument("--dynamic", action="store_true")
+    p.add_argument(
+        "--dynamic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable dynamic ground-truth evolution (default: enabled; use --no-dynamic to disable).",
+    )
     p.add_argument("--no-miopic", dest="miopic", action="store_false")
     p.set_defaults(miopic=True)
     p.add_argument("--detection-length", type=int, default=2)

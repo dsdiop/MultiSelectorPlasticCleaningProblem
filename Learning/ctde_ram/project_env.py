@@ -286,9 +286,11 @@ class ProjectPatrollingExpertNuCTDEEnv(ProjectPatrollingCTDEEnv):
         nu = self._role_weights_to_nu(role_weights)
         action_dict = self._nu_to_actions(nu, hard_roles=hard_roles)
         obs, reward, done_dict, info = self.env.step(action_dict)
-        # MultiAgentNuWrapper used any(done.values()). Keep that behavior here
-        # because this mode is meant to reproduce the old make_env substrate.
-        done = bool(any(done_dict.values())) if isinstance(done_dict, dict) else bool(done_dict)
+        # Match MultiAgentPatrolling/TrainNus semantics: agents that exhaust
+        # their budget become inactive, while the episode continues until the
+        # whole fleet is done. Stopping on any(done) truncated the mission when
+        # the first vehicle finished.
+        done = bool(all(done_dict.values())) if isinstance(done_dict, dict) else bool(done_dict)
         info = dict(info or {})
         info["nu"] = nu
         info["movement_actions"] = action_dict
@@ -359,9 +361,9 @@ def build_env_factory_from_existing_project(args):
         number_of_vehicles=n_agents,
         seed=getattr(args, "seed", 0),
         miopic=getattr(args, "miopic", True),
-        dynamic=getattr(args, "dynamic", False),
+        dynamic=getattr(args, "dynamic", True),
         detection_length=getattr(args, "detection_length", 2),
-        movement_length=getattr(args, "movement_length", 2),
+        movement_length=getattr(args, "movement_length", 1),
         max_collisions=getattr(args, "max_collisions", 15),
         reward_type=getattr(args, "reward_type", "Distance Field"),
         convert_to_uint8=getattr(args, "convert_to_uint8", False),
