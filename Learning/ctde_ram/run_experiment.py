@@ -66,6 +66,21 @@ def sample_weights(rng, k: int = 2, mode: str = "uniform", alpha: float = 0.5):
     return (w / s) if s > 0 else np.ones(k, dtype=np.float32) / k
 
 
+def annealed_weight_alpha(
+    start: float, end: float | None, episode: int, total_episodes: int,
+    anneal_fraction: float = 1.0,
+) -> float:
+    """Linear preference-sampler concentration schedule."""
+    if end is None:
+        return float(start)
+    if anneal_fraction <= 0.0:
+        raise ValueError("weight_alpha_anneal_fraction must be positive")
+    # Episodes are zero-indexed, so total_episodes-1 is the final sampled point.
+    horizon = max(float(max(total_episodes - 1, 1)) * float(anneal_fraction), 1.0)
+    progress = min(max(float(episode) / horizon, 0.0), 1.0)
+    return float(start + progress * (float(end) - float(start)))
+
+
 def progress_write(message: str) -> None:
     if tqdm is not None:
         tqdm.write(message)
@@ -314,6 +329,14 @@ def parse_args(argv=None):
         help="Dirichlet/Beta concentration for --weight-sampling beta; <1 favors pure-preference extremes.",
     )
     p.add_argument(
+        "--weight-alpha-end", type=float, default=None,
+        help="Optional final Dirichlet/Beta concentration; enables linear annealing from --weight-alpha.",
+    )
+    p.add_argument(
+        "--weight-alpha-anneal-fraction", type=float, default=1.0,
+        help="Fraction of training over which weight alpha reaches --weight-alpha-end.",
+    )
+    p.add_argument(
         "--no-reward-normalization",
         action="store_true",
         help="Legacy shortcut; equivalent to --role-reward-norm none.",
@@ -539,6 +562,12 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
 
 def main():
     args = parse_args()
+    if args.weight_alpha <= 0.0:
+        raise ValueError("--weight-alpha must be positive")
+    if args.weight_alpha_end is not None and args.weight_alpha_end <= 0.0:
+        raise ValueError("--weight-alpha-end must be positive")
+    if args.weight_alpha_anneal_fraction <= 0.0:
+        raise ValueError("--weight-alpha-anneal-fraction must be positive")
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -695,18 +724,28 @@ def main():
             eps_ram = args.role_q_epsilon_start + progress * (args.role_q_epsilon_end - args.role_q_epsilon_start)
         else:
             eps_ram = max(0.05, 1.0 - ep / max(1, args.episodes * 0.75))
+        current_weight_alpha = annealed_weight_alpha(
+            args.weight_alpha, args.weight_alpha_end, ep, args.episodes,
+            args.weight_alpha_anneal_fraction,
+        )
         if args.ram_mode == "ppo_ram" and args.ppo_preference_sampling == "stratified":
             w = ppo_preference_grid[ep % len(ppo_preference_grid)].copy()
         else:
-            w = sample_weights(rng, env.K, mode=args.weight_sampling, alpha=args.weight_alpha)
+            w = sample_weights(rng, env.K, mode=args.weight_sampling, alpha=current_weight_alpha)
         m = trainer.run_episode(env, w, eps_low, eps_ram)
         head_loss = np.mean(m["head_losses"]) if m["head_losses"] else float("nan")
         ram_loss = np.mean(m["ram_losses"]) if m["ram_losses"] else float("nan")
-        train_row = {"episode": ep, "w0": float(w[0]), "w1": float(w[1]) if env.K > 1 else 0.0}
+        train_row = {
+            "episode": ep,
+            "w0": float(w[0]),
+            "w1": float(w[1]) if env.K > 1 else 0.0,
+            "weight_alpha": current_weight_alpha,
+        }
         train_row.update(m)
         append_csv_row(os.path.join(metrics_dir, "train_episodes.csv"), train_row)
         write_json(os.path.join(metrics_dir, "latest_train_episode.json"), train_row)
         trainer.tb.log_scalar("train/weight_0", float(w[0]), step=ep)
+        trainer.tb.log_scalar("train/weight_alpha", current_weight_alpha, step=ep)
         if env.K > 1:
             trainer.tb.log_scalar("train/weight_1", float(w[1]), step=ep)
         trainer.tb.flush()

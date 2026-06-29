@@ -223,8 +223,8 @@ class PrioritizedHardRoleReplayBuffer:
         self.previous_roles = np.zeros((self.capacity, self.n_agents), dtype=np.int64)
         self.roles = np.zeros((self.capacity, self.n_agents), dtype=np.int64)
         self.next_previous_roles = np.zeros((self.capacity, self.n_agents), dtype=np.int64)
-        self.budget = np.zeros((self.capacity, 1), dtype=np.float32)
-        self.next_budget = np.zeros((self.capacity, 1), dtype=np.float32)
+        self.budget = np.zeros((self.capacity, self.n_agents, 1), dtype=np.float32)
+        self.next_budget = np.zeros((self.capacity, self.n_agents, 1), dtype=np.float32)
         self.rewards = np.zeros(self.capacity, dtype=np.float32)
         self.dones = np.zeros(self.capacity, dtype=np.float32)
         self.durations = np.ones(self.capacity, dtype=np.float32)
@@ -241,10 +241,20 @@ class PrioritizedHardRoleReplayBuffer:
         self.previous_roles[i], self.roles[i] = previous_roles, roles
         self.next_previous_roles[i] = next_previous_roles
         self.rewards[i], self.dones[i], self.durations[i] = reward, done, duration
-        self.budget[i], self.next_budget[i] = budget, next_budget
+        self.budget[i] = self._format_budget(budget)
+        self.next_budget[i] = self._format_budget(next_budget)
         self.priorities[i] = self.priorities[:self.size].max() if self.size else 1.0
         self.ptr += 1
         self.size = min(self.size + 1, self.capacity)
+
+    def _format_budget(self, budget):
+        value = np.asarray(budget, dtype=np.float32)
+        if value.size == 1:
+            return np.full((self.n_agents, 1), float(value.reshape(-1)[0]), dtype=np.float32)
+        value = value.reshape(-1, 1)
+        if value.shape != (self.n_agents, 1):
+            raise ValueError(f"Expected one budget per agent [{self.n_agents},1], got {value.shape}")
+        return value
 
     def sample(self, batch_size: int, beta: float, device="cpu"):
         scaled = np.maximum(self.priorities[:self.size], self.eps) ** self.alpha
@@ -287,4 +297,7 @@ class PrioritizedHardRoleReplayBuffer:
             if name in {"ptr", "size"} or name not in state:
                 continue
             target = getattr(self, name)
-            target[:self.size] = np.asarray(state[name])[:self.size]
+            values = np.asarray(state[name])[:self.size]
+            if name in {"budget", "next_budget"} and values.ndim == 2:
+                values = np.repeat(values[:, None, :], self.n_agents, axis=1)
+            target[:self.size] = values

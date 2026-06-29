@@ -183,9 +183,13 @@ class ProjectPatrollingCTDEEnv:
         return float(np.count_nonzero(np.asarray(gt_map)[visitable] > 0) / denom)
 
     def budget_frac(self) -> float:
+        return float(self.budget_fracs().mean())
+
+    def budget_fracs(self) -> np.ndarray:
+        """Remaining distance-budget fraction for each individual agent."""
         distances = np.asarray(self.env.fleet.get_distances(), dtype=np.float32)
         remaining = 1.0 - distances / max(float(self.env.distance_budget), 1.0)
-        return float(np.clip(remaining, 0.0, 1.0).mean())
+        return np.clip(remaining, 0.0, 1.0).astype(np.float32)
 
     def close(self):
         close = getattr(self.env, "close", None)

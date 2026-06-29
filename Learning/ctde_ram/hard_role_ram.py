@@ -107,9 +107,22 @@ class HardRoleAttentionTrunk(nn.Module):
         z = self.map_cnn(maps.reshape(batch * n_agents, *maps.shape[2:]))
         z = z.reshape(batch, n_agents, self.d_model)
         role_z = self.previous_role_embedding(previous_roles.long())
+        # Preferred path: one remaining-budget fraction per agent [B,N,1].
+        # Keep [B] / [B,1] support for old checkpoints and synthetic callers by
+        # broadcasting the fleet scalar to every homogeneous agent.
         if budget.ndim == 1:
             budget = budget.unsqueeze(-1)
-        budget_z = self.budget_projection(budget).unsqueeze(1)
+        if budget.ndim == 2:
+            if budget.shape[1] == 1:
+                budget_z = self.budget_projection(budget).unsqueeze(1).expand(-1, n_agents, -1)
+            elif budget.shape[1] == n_agents:
+                budget_z = self.budget_projection(budget.unsqueeze(-1))
+            else:
+                raise ValueError(f"Budget must be [B,1], [B,N], or [B,N,1], got {tuple(budget.shape)}")
+        elif budget.ndim == 3 and budget.shape[1:] == (n_agents, 1):
+            budget_z = self.budget_projection(budget)
+        else:
+            raise ValueError(f"Budget must be [B,1], [B,N], or [B,N,1], got {tuple(budget.shape)}")
         token = z + role_z + budget_z
         gamma, beta = self.preference_film(preference)
         token = gamma.unsqueeze(1) * token + beta.unsqueeze(1)

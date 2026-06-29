@@ -703,6 +703,19 @@ class CTDERAMTrainer:
             value = value()
         return float(value)
 
+    def _agent_budget_fracs(self, env) -> np.ndarray:
+        """Return one remaining-budget fraction per agent as [N,1]."""
+        value = getattr(env, "budget_fracs", None)
+        if callable(value):
+            budgets = np.asarray(value(), dtype=np.float32).reshape(-1)
+            if budgets.shape != (self.N,):
+                raise ValueError(f"budget_fracs() must return [{self.N}], got {budgets.shape}")
+        else:
+            budgets = np.full(
+                self.N, self._env_value(env, "budget_frac", 1.0), dtype=np.float32
+            )
+        return np.clip(budgets, 0.0, 1.0).reshape(self.N, 1)
+
     def _build_extra(self, env, r_accum, prev_W, scal_weights):
         # The extra vector is the non-neural mission context appended to the
         # learned fleet embedding g.
@@ -1280,7 +1293,9 @@ class CTDERAMTrainer:
     def _hard_role_state(self, obs_all, previous_roles, scal_weights):
         maps = torch.as_tensor(np.stack(obs_all), dtype=torch.float32, device=self.device).unsqueeze(0)
         previous = torch.as_tensor(previous_roles, dtype=torch.long, device=self.device).unsqueeze(0)
-        budget = torch.tensor([[self._env_value(self._active_env, "budget_frac", 1.0)]], dtype=torch.float32, device=self.device)
+        budget = torch.as_tensor(
+            self._agent_budget_fracs(self._active_env), dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
         preference = torch.as_tensor(scal_weights, dtype=torch.float32, device=self.device).unsqueeze(0)
         return maps, previous, budget, preference
 
@@ -1354,7 +1369,7 @@ class CTDERAMTrainer:
         while not done:
             start_obs = np.asarray(obs_all, dtype=np.float32)
             start_prev = previous_roles.copy()
-            start_budget = self._env_value(env, "budget_frac", 1.0)
+            start_budget = self._agent_budget_fracs(env)
             roles, policy_info = self._select_main_hard_roles(
                 obs_all, previous_roles, scal_weights, epsilon_ram,
                 training=training, return_attn=attention_records is not None,
@@ -1410,21 +1425,21 @@ class CTDERAMTrainer:
                 ep_step += 1
 
             next_obs = np.asarray(obs_all, dtype=np.float32)
-            next_budget = self._env_value(env, "budget_frac", 1.0)
+            next_budget = self._agent_budget_fracs(env)
             if training and self.ram_mode == "ppo_ram":
                 self.ppo_rollout.store(
                     maps=start_obs, preference=scal_weights, previous_roles=start_prev,
                     roles=roles_np, old_logprob=float(policy_info["logprob"].item()),
                     value=_tensor_to_numpy(policy_info["value"], dtype=np.float32),
                     reward=(macro_reward_vector if self.ppo_critic_mode == "vector" else macro_reward),
-                    done=float(done), duration=float(duration), budget=[start_budget],
+                    done=float(done), duration=float(duration), budget=start_budget,
                     next_maps=next_obs, next_previous_roles=roles_np,
-                    next_budget=[next_budget],
+                    next_budget=next_budget,
                 )
             elif training:
                 self.hard_role_replay.store(
                     start_obs, scal_weights, start_prev, roles_np, macro_reward,
-                    next_obs, roles_np, done, duration, [start_budget], [next_budget],
+                    next_obs, roles_np, done, duration, start_budget, next_budget,
                 )
                 update = self.hard_role_q_learner.update(self.hard_role_replay, self.batch_role, self._per_beta())
                 if update is not None:
@@ -1993,6 +2008,49 @@ class CTDERAMTrainer:
                     step=np.asarray([x["step"] for x in attention_records]),
                     macro_step=np.asarray([x["macro_step"] for x in attention_records]),
                 )
+            if plot_path:
+                try:
+                    import matplotlib
+                    matplotlib.use("Agg")
+                    import matplotlib.pyplot as plt
+
+                    os.makedirs(os.path.dirname(plot_path) or ".", exist_ok=True)
+                    x = [row["w0"] for row in rows]
+                    fig, ax = plt.subplots(figsize=(7, 4.5))
+                    ax.plot(x, [row["role0_argmax_frac"] for row in rows], marker="o", label="clean role (0)")
+                    ax.plot(x, [row["role1_argmax_frac"] for row in rows], marker="o", label="explore role (1)")
+                    ax.set_xlabel("cleaning preference $w_0$")
+                    ax.set_ylabel("selected role fraction")
+                    ax.set_ylim(-0.05, 1.05)
+                    ax.invert_xaxis()
+                    ax.grid(True, alpha=0.25)
+                    ax.legend(loc="best")
+                    ax.set_title("Hard-role preference sensitivity")
+                    fig.tight_layout()
+                    fig.savefig(plot_path, dpi=180)
+                    plt.close(fig)
+                    _progress_write(f"[probe] wrote role-fraction plot: {plot_path}")
+                except Exception as exc:
+                    _progress_write(f"[probe] role-fraction plot skipped: {exc!r}")
+            if pareto_plot_path:
+                points = np.asarray(
+                    [[row["coverage"], row["trash_cleaned"]] for row in rows],
+                    dtype=np.float64,
+                )
+                front = pareto_front(points)
+                pareto_result = {
+                    "all_points": points,
+                    "pareto_front": front,
+                    "hypervolume": hypervolume(front, np.zeros(2, dtype=np.float64)),
+                    "per_weight": [
+                        ((row["w0"], row["w1"]), row) for row in rows
+                    ],
+                    "ref_point": np.zeros(2, dtype=np.float64),
+                }
+                if plot_pareto(pareto_result, pareto_plot_path):
+                    _progress_write(f"[probe] wrote Pareto plot: {pareto_plot_path}")
+                else:
+                    _progress_write("[probe] Pareto plot skipped")
             for row in rows:
                 _progress_write(
                     f"[probe] w=({row['w0']:.2f},{row['w1']:.2f}) "
