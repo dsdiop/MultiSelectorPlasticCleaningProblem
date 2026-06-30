@@ -399,6 +399,16 @@ class CTDERAMTrainer:
         self.ppo_critic_mode = ppo_critic_mode.lower()
         self.ppo_critic_popart = bool(ppo_critic_popart)
         self.ppo_advantage_scalarization = ppo_advantage_scalarization.lower()
+        if (
+            ram_mode == "ppo_ram"
+            and self.ppo_critic_mode == "vector"
+            and self.ram_reward_mode == "delta_metrics"
+            and not self.ppo_critic_popart
+        ):
+            raise ValueError(
+                "delta_metrics with a vector PPO critic requires --ppo-critic-popart "
+                "so each objective return is normalized independently"
+            )
         if self.main_hard_role_mode and ram_mode == "ppo_ram" and self.ppo_rollout_macro_steps <= 0:
             raise ValueError("ppo_rollout_macro_steps must be positive")
 
@@ -1384,6 +1394,10 @@ class CTDERAMTrainer:
             start_obs = np.asarray(obs_all, dtype=np.float32)
             start_prev = previous_roles.copy()
             start_budget = self._agent_budget_fracs(env)
+            window_start_metrics = {
+                "trash_cleaned": self._env_value(env, "trash_cleaned_pct", 0.0),
+                "coverage": self._env_value(env, "coverage_pct", 0.0),
+            }
             roles, policy_info = self._select_main_hard_roles(
                 obs_all, previous_roles, scal_weights, epsilon_ram,
                 training=training, return_attn=attention_records is not None,
@@ -1408,35 +1422,61 @@ class CTDERAMTrainer:
                 obs_next, r_vecs, done, info, _ = self._step_env_with_hard_roles(
                     env, obs_all, roles, epsilon_low if training else 0.0
                 )
-                fleet_components = self._stack_rewards(r_vecs).sum(dim=0)
-                # Normalize objective components before nonlinear scalarization.
-                # In particular, EWC/WPOP are designed for calibrated,
-                # non-negative inputs; the default min-max normalizer maps the
-                # project reward components to [0,1] before scalarization.
-                # Scalarize each environment reward first, then discount it by
-                # its offset inside this SMDP macro action.
-                scalar_step = self._scalarize_role_reward(
-                    fleet_components,
-                    torch.as_tensor(scal_weights, dtype=torch.float32, device=self.device),
-                    update_norm=training,
-                )
-                raw_np = _tensor_to_numpy(fleet_components, dtype=np.float32)
-                if self.role_reward_norm_name == "minmax":
-                    normalized_components = self.role_reward_norm.normalize_tensor(fleet_components)
-                else:
-                    normalized_components = fleet_components
-                raw_reward_sum += raw_np
-                norm_reward_sum += _tensor_to_numpy(normalized_components, dtype=np.float32)
-                scalar_reward_sum += float(scalar_step.item())
-                reward_steps += 1
-                macro_gamma = self.hard_role_gamma if self.ram_mode == "hard_role_q" else self.gamma
-                macro_reward += (macro_gamma ** duration) * float(scalar_step.item())
-                macro_reward_vector += (macro_gamma ** duration) * _tensor_to_numpy(
-                    normalized_components, dtype=np.float32
-                )
+                if self.ram_reward_mode == "component_rewards":
+                    fleet_components = self._stack_rewards(r_vecs).sum(dim=0)
+                    # Component rewards retain the original discounted
+                    # within-window accumulation and optional min-max scaling.
+                    scalar_step = self._scalarize_role_reward(
+                        fleet_components,
+                        torch.as_tensor(scal_weights, dtype=torch.float32, device=self.device),
+                        update_norm=training,
+                    )
+                    raw_np = _tensor_to_numpy(fleet_components, dtype=np.float32)
+                    if self.role_reward_norm_name == "minmax":
+                        normalized_components = self.role_reward_norm.normalize_tensor(fleet_components)
+                    else:
+                        normalized_components = fleet_components
+                    raw_reward_sum += raw_np
+                    norm_reward_sum += _tensor_to_numpy(normalized_components, dtype=np.float32)
+                    scalar_reward_sum += float(scalar_step.item())
+                    reward_steps += 1
+                    macro_gamma = self.hard_role_gamma if self.ram_mode == "hard_role_q" else self.gamma
+                    macro_reward += (macro_gamma ** duration) * float(scalar_step.item())
+                    macro_reward_vector += (macro_gamma ** duration) * _tensor_to_numpy(
+                        normalized_components, dtype=np.float32
+                    )
                 obs_all = obs_next
                 duration += 1
                 ep_step += 1
+
+            if self.ram_reward_mode == "delta_metrics":
+                # One raw mission-progress vector per macro transition. Do not
+                # scalarize or normalize it before vector GAE; the PPO learner
+                # standardizes advantages independently per objective.
+                window_end_metrics = {
+                    "trash_cleaned": self._env_value(
+                        env, "trash_cleaned_pct", float(info.get("trash_cleaned", 0.0))
+                    ),
+                    "coverage": self._env_value(
+                        env, "coverage_pct", float(info.get("coverage", 0.0))
+                    ),
+                }
+                delta_components = self._metric_reward_components(
+                    window_start_metrics, window_end_metrics
+                )
+                macro_reward_vector = _tensor_to_numpy(delta_components, dtype=np.float32)
+                # Kept only for scalar-critic/HardRoleQ compatibility and
+                # reporting. Vector PPO stores macro_reward_vector below.
+                delta_scalar = self._scalarize_role_reward(
+                    delta_components,
+                    torch.as_tensor(scal_weights, dtype=torch.float32, device=self.device),
+                    update_norm=False,
+                )
+                macro_reward = float(delta_scalar.item())
+                raw_reward_sum += macro_reward_vector
+                norm_reward_sum += macro_reward_vector
+                scalar_reward_sum += macro_reward
+                reward_steps += 1
 
             next_obs = np.asarray(obs_all, dtype=np.float32)
             next_budget = self._agent_budget_fracs(env)

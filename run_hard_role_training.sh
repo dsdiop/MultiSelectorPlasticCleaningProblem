@@ -23,6 +23,7 @@ set -euo pipefail
 #   PPOT1WPOP        PPO T1 with WPOP role-reward scalarization
 #   PPOT1WPOPPrefToken  PPO T1, WPOP reward, preference token, two attention layers
 #   PPOT1VectorCriticAdvWPOP  PPO T1, vector critic, PopArt, WPOP advantages, FiLM
+#   PPOT1VectorCriticDeltaAdvWPOP  same vector PPO using raw mission-metric deltas
 #   PPOT1VectorWPOP  short alias for PPOT1VectorCriticAdvWPOP
 #   PPOT1VectorWPOPToken  PPO T1 with vector critic, WPOP advantages, preference token and two attention layers, no popart
 #   PPOT1WP          PPO T1 with WP role-reward scalarization,
@@ -111,6 +112,7 @@ METHOD_TAG=""
 MODE_ARGS=()
 EXTRA_ARGS=()
 ROLE_SCALARIZATION="${ROLE_SCALARIZATION:-ws}"
+RAM_REWARD_MODE="${RAM_REWARD_MODE:-component_rewards}"
 PPO_CRITIC_MODE="${PPO_CRITIC_MODE:-scalar}"
 PPO_CRITIC_POPART="${PPO_CRITIC_POPART:-0}"
 PPO_ADVANTAGE_SCALARIZATION="${PPO_ADVANTAGE_SCALARIZATION:-ws}"
@@ -161,6 +163,15 @@ case "${EXP}" in
     ppot1vectorwpop|ppo_t1_vector_wpop|ppot1vectorcriticadvwpop|ppo_t1_vector_critic_adv_wpop)
         METHOD_TAG="PPO_RAM_FiLM_Attn_T1_VectorCritic_PopArt_AdvWPOP"
         RUN_T_ROLE=1
+        PPO_CRITIC_MODE="vector"
+        PPO_CRITIC_POPART=1
+        PPO_ADVANTAGE_SCALARIZATION="wpop"
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1vectorcriticdeltaadvwpop|ppo_t1_vector_critic_delta_adv_wpop)
+        METHOD_TAG="PPO_RAM_FiLM_Attn_T1_VectorCritic_PopArt_DeltaMetrics_AdvWPOP"
+        RUN_T_ROLE=1
+        RAM_REWARD_MODE="delta_metrics"
         PPO_CRITIC_MODE="vector"
         PPO_CRITIC_POPART=1
         PPO_ADVANTAGE_SCALARIZATION="wpop"
@@ -318,7 +329,7 @@ COMMON_ARGS=(
     --gamma 0.99
     --role-reward-norm minmax
     --role-scalarization "${ROLE_SCALARIZATION}"
-    --ram-reward-mode component_rewards
+    --ram-reward-mode "${RAM_REWARD_MODE}"
     --d-model "${D_MODEL}"
     --n-attn-heads "${N_ATTN_HEADS}"
     --n-attn-layers "${N_ATTN_LAYERS}"
