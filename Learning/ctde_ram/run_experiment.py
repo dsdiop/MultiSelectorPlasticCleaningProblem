@@ -290,6 +290,14 @@ def parse_args(argv=None):
         default="film",
         help="Condition hard-role attention with FiLM or an additional preference token.",
     )
+    p.add_argument(
+        "--hard-role-deep-input-projections",
+        action="store_true",
+        help=(
+            "Use MLP projections (input->d_model->d_model) for budget and the "
+            "preference token. Disabled by default for old-checkpoint compatibility."
+        ),
+    )
     # PPO-RAM.
     p.add_argument("--ppo-epochs", type=int, default=4)
     p.add_argument("--ppo-minibatch-size", type=int, default=128)
@@ -556,6 +564,7 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         attn_ff_dim=args.attn_ff_dim,
         preference_role_bias=args.preference_role_bias,
         hard_role_preference_conditioning=args.hard_role_preference_conditioning,
+        hard_role_deep_input_projections=args.hard_role_deep_input_projections,
         ppo_epochs=args.ppo_epochs,
         ppo_minibatch_size=args.ppo_minibatch_size,
         ppo_rollout_macro_steps=args.ppo_rollout_macro_steps,

@@ -19,8 +19,13 @@ set -euo pipefail
 #
 # Focused alternatives/ablations:
 #   PPOT1            PPO with role decision every environment step
+#   PPOPrefToken     replace FiLM with a preference token and two attention layers
 #   PPOT1WPOP        PPO T1 with WPOP role-reward scalarization
-#   PPOT1VectorWPOP  PPO T1 with vector critic, PopArt, WPOP advantages
+#   PPOT1WPOPPrefToken  PPO T1, WPOP reward, preference token, two attention layers
+#   PPOT1VectorCriticAdvWPOP  PPO T1, vector critic, PopArt, WPOP advantages, FiLM
+#   PPOT1VectorWPOP  short alias for PPOT1VectorCriticAdvWPOP
+#   PPOT1VectorWPOPToken  PPO T1 with vector critic, WPOP advantages, preference token and two attention layers, no popart
+#   PPOT1WP          PPO T1 with WP role-reward scalarization,
 #   HardQT1          HardRoleQ with role decision every environment step
 #   PPOT20           longer role commitment
 #   HardQT20         longer role commitment
@@ -66,8 +71,8 @@ PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
 RUN_SCRIPT="${PROJECT_ROOT}/Learning/ctde_ram/run_experiment.py"
 OUTPUT_DIR="${OUTPUT_DIR:-Learning/ctde_ram/outputs}"
 
-# Defaults follow the latest Alamillo launcher. Override both for Malaga.
-MAP_NAME="${MAP_NAME:-alamillo_lake}"
+# Defaults follow the latest Malaga launcher. Override both for Alamillo.
+MAP_NAME="${MAP_NAME:-malaga_port}"
 # IF DIFFERENT MAP, MAKE SURE TO CHANGE THE PATH_PLANNER_FOLDER ACCORDINGLY. THE FOLLOWING CODE CHECK THE MAP NAME
 if [[ "${MAP_NAME}" == "malaga_port" ]]; then
     PATH_PLANNER_FOLDER="${PATH_PLANNER_FOLDER:-Experimento_clean28_malaga_port_macro_plastic_random_nus_nsteps5_distbudget100_old_reward}"
@@ -89,12 +94,15 @@ PROBE_POINTS="${PROBE_POINTS:-20}"
 PROBE_EPISODES="${PROBE_EPISODES:-100}"
 WEIGHT_ALPHA="${WEIGHT_ALPHA:-0.4}"
 DRY_RUN="${DRY_RUN:-0}"
+CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+PYTHONHASHSEED="${PYTHONHASHSEED:-${SEED}}"
 
 # Shared architecture from the hard-role specification.
 D_MODEL="${D_MODEL:-64}"
 N_ATTN_HEADS="${N_ATTN_HEADS:-4}"
 N_ATTN_LAYERS="${N_ATTN_LAYERS:-1}"
 ATTN_FF_DIM="${ATTN_FF_DIM:-128}"
+HARD_ROLE_PREFERENCE_CONDITIONING="${HARD_ROLE_PREFERENCE_CONDITIONING:-film}"
 
 # ---- Resolve experiment ------------------------------------------------------
 
@@ -106,6 +114,7 @@ ROLE_SCALARIZATION="${ROLE_SCALARIZATION:-ws}"
 PPO_CRITIC_MODE="${PPO_CRITIC_MODE:-scalar}"
 PPO_CRITIC_POPART="${PPO_CRITIC_POPART:-0}"
 PPO_ADVANTAGE_SCALARIZATION="${PPO_ADVANTAGE_SCALARIZATION:-ws}"
+HARD_ROLE_DEEP_INPUT_PROJECTIONS="${HARD_ROLE_DEEP_INPUT_PROJECTIONS:-1}"
 RUN_T_ROLE="${T_ROLE}"
 
 case "${EXP}" in
@@ -135,12 +144,36 @@ case "${EXP}" in
         ROLE_SCALARIZATION="wpop"
         MODE_ARGS=(--ram-mode ppo_ram)
         ;;
-    ppot1vectorwpop|ppo_t1_vector_wpop)
+    ppot1wpoppreftoken|ppo_t1_wpop_pref_token)
+        METHOD_TAG="PPO_RAM_PrefToken_AttnL2_T1_WPOP"
+        RUN_T_ROLE=1
+        ROLE_SCALARIZATION="wpop"
+        HARD_ROLE_PREFERENCE_CONDITIONING="pref_token"
+        N_ATTN_LAYERS=2
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1wp|ppo_t1_wp)
+        METHOD_TAG="PPO_RAM_FiLM_Attn_T1_WP"
+        RUN_T_ROLE=1
+        ROLE_SCALARIZATION="wp"
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1vectorwpop|ppo_t1_vector_wpop|ppot1vectorcriticadvwpop|ppo_t1_vector_critic_adv_wpop)
         METHOD_TAG="PPO_RAM_FiLM_Attn_T1_VectorCritic_PopArt_AdvWPOP"
         RUN_T_ROLE=1
         PPO_CRITIC_MODE="vector"
         PPO_CRITIC_POPART=1
         PPO_ADVANTAGE_SCALARIZATION="wpop"
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1vectorwpoptoken|ppo_t1_vector_wpop_token)
+        METHOD_TAG="PPO_RAM_PrefToken_AttnL2_T1_VectorCritic_AdvWPOP"
+        RUN_T_ROLE=1
+        PPO_CRITIC_MODE="vector"
+        PPO_CRITIC_POPART=0
+        PPO_ADVANTAGE_SCALARIZATION="wpop"
+        HARD_ROLE_PREFERENCE_CONDITIONING="pref_token"
+        N_ATTN_LAYERS=2
         MODE_ARGS=(--ram-mode ppo_ram)
         ;;
     hardqt1|hardq_t1)
@@ -178,6 +211,12 @@ case "${EXP}" in
     ppotwolayers|ppo_two_layers)
         METHOD_TAG="PPO_RAM_AttnL2"
         MODE_ARGS=(--ram-mode ppo_ram)
+        N_ATTN_LAYERS=2
+        ;;
+    ppopreftoken|ppo_pref_token)
+        METHOD_TAG="PPO_RAM_PrefToken_AttnL2"
+        MODE_ARGS=(--ram-mode ppo_ram)
+        HARD_ROLE_PREFERENCE_CONDITIONING="pref_token"
         N_ATTN_LAYERS=2
         ;;
     ppoprefbias|ppo_pref_bias)
@@ -228,6 +267,10 @@ case "${EXP}" in
         exit 2
         ;;
 esac
+
+if [[ "${HARD_ROLE_DEEP_INPUT_PROJECTIONS}" == "1" ]]; then
+    METHOD_TAG="${METHOD_TAG}_DeepInputProj"
+fi
 
 RUN_NAME="${MAP_NAME}_F4_${METHOD_TAG}_T${RUN_T_ROLE}_ep${EPISODES}_beta${WEIGHT_ALPHA}_s${SEED}"
 SESSION_NAME="${RUN_NAME}"
@@ -280,6 +323,7 @@ COMMON_ARGS=(
     --n-attn-heads "${N_ATTN_HEADS}"
     --n-attn-layers "${N_ATTN_LAYERS}"
     --attn-ff-dim "${ATTN_FF_DIM}"
+    --hard-role-preference-conditioning "${HARD_ROLE_PREFERENCE_CONDITIONING}"
     --ppo-epochs 4
     --ppo-minibatch-size 256
     --ppo-rollout-macro-steps 2048
@@ -323,10 +367,15 @@ COMMON_ARGS=(
 if [[ "${PPO_CRITIC_POPART}" == "1" ]]; then
     COMMON_ARGS+=(--ppo-critic-popart)
 fi
+if [[ "${HARD_ROLE_DEEP_INPUT_PROJECTIONS}" == "1" ]]; then
+    COMMON_ARGS+=(--hard-role-deep-input-projections)
+fi
 
 {
     echo "#!/usr/bin/env bash"
     printf "cd %q\n" "${PROJECT_ROOT}"
+    printf "export CUBLAS_WORKSPACE_CONFIG=%q\n" "${CUBLAS_WORKSPACE_CONFIG}"
+    printf "export PYTHONHASHSEED=%q\n" "${PYTHONHASHSEED}"
     printf "%q " "${PYTHON_BIN}" "${RUN_SCRIPT}" "${COMMON_ARGS[@]}" "${MODE_ARGS[@]}" "${EXTRA_ARGS[@]}"
     echo
 } > "${CMD_FILE}"
@@ -342,6 +391,8 @@ echo "[launch] map        : ${MAP_NAME}"
 echo "[launch] T_role     : ${RUN_T_ROLE}"
 echo "[launch] critic     : ${PPO_CRITIC_MODE} (popart=${PPO_CRITIC_POPART})"
 echo "[launch] advantage  : ${PPO_ADVANTAGE_SCALARIZATION}"
+echo "[launch] deep input : ${HARD_ROLE_DEEP_INPUT_PROJECTIONS}"
+echo "[launch] deterministic: strict (CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG})"
 echo "[launch] episodes   : ${EPISODES}"
 echo "[launch] tmux       : ${SESSION_NAME}"
 echo "[launch] log        : ${LOG_FILE}"
@@ -350,7 +401,7 @@ echo
 
 if [[ "${DRY_RUN}" == "1" ]]; then
     echo "[dry-run] No tmux session was started. Exact command:"
-    sed -n '1,3p' "${CMD_FILE}"
+    sed -n '1,5p' "${CMD_FILE}"
     exit 0
 fi
 

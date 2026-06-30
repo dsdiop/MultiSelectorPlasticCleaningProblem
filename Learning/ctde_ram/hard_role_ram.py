@@ -85,9 +85,11 @@ class HardRoleAttentionTrunk(nn.Module):
         self, d_model=64, n_heads=4, n_layers=1, ff_dim=128,
         preference_role_bias: bool = False,
         preference_conditioning: str = "film",
+        deep_input_projections: bool = False,
     ):
         super().__init__()
         self.d_model = int(d_model)
+        self.deep_input_projections = bool(deep_input_projections)
         self.preference_conditioning = str(preference_conditioning).lower()
         if self.preference_conditioning not in {"film", "pref_token"}:
             raise ValueError("preference_conditioning must be one of: film, pref_token")
@@ -95,15 +97,27 @@ class HardRoleAttentionTrunk(nn.Module):
             raise ValueError("pref_token preference conditioning requires n_layers >= 2")
         self.map_cnn = AllocentricMapCNN(d_model)
         self.previous_role_embedding = nn.Embedding(2, d_model)
-        self.budget_projection = nn.Linear(1, d_model)
+        self.budget_projection = (
+            nn.Sequential(
+                nn.Linear(1, d_model), nn.ReLU(),
+                nn.Linear(d_model, d_model),
+            )
+            if self.deep_input_projections else nn.Linear(1, d_model)
+        )
         self.preference_film = (
             PreferenceFiLM(2, d_model)
             if self.preference_conditioning == "film" else None
         )
-        self.preference_projection = (
-            nn.Linear(2, d_model)
-            if self.preference_conditioning == "pref_token" else None
-        )
+        if self.preference_conditioning == "pref_token":
+            self.preference_projection = (
+                nn.Sequential(
+                    nn.Linear(2, d_model), nn.ReLU(),
+                    nn.Linear(d_model, d_model),
+                )
+                if self.deep_input_projections else nn.Linear(2, d_model)
+            )
+        else:
+            self.preference_projection = None
         self.layers = nn.ModuleList([
             AttentionEncoderLayer(d_model, n_heads, ff_dim) for _ in range(n_layers)
         ])
