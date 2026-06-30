@@ -9,6 +9,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
+
+# cuBLAS reads this when CUDA is initialized. Keep a reproducible workspace
+# choice even when this module is launched directly instead of through the
+# repository shell launcher.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import numpy as np
 import torch
 
@@ -138,6 +145,12 @@ def parse_args(argv=None):
     p.add_argument("--smoke", action="store_true", help="tiny fast end-to-end check")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=int, default=-1, help="-1 for CPU, otherwise CUDA device index")
+    p.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use strict deterministic PyTorch/CUDA algorithms (default: enabled).",
+    )
     p.add_argument("--run-name", type=str, default=None, help="Name for output/checkpoint/TensorBoard folder.")
     p.add_argument(
         "--output-dir",
@@ -271,6 +284,12 @@ def parse_args(argv=None):
     p.add_argument("--n-attn-layers", type=int, default=1)
     p.add_argument("--attn-ff-dim", type=int, default=128)
     p.add_argument("--preference-role-bias", action="store_true", default=False)
+    p.add_argument(
+        "--hard-role-preference-conditioning",
+        choices=["film", "pref_token"],
+        default="film",
+        help="Condition hard-role attention with FiLM or an additional preference token.",
+    )
     # PPO-RAM.
     p.add_argument("--ppo-epochs", type=int, default=4)
     p.add_argument("--ppo-minibatch-size", type=int, default=128)
@@ -536,6 +555,7 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         n_attn_layers=args.n_attn_layers,
         attn_ff_dim=args.attn_ff_dim,
         preference_role_bias=args.preference_role_bias,
+        hard_role_preference_conditioning=args.hard_role_preference_conditioning,
         ppo_epochs=args.ppo_epochs,
         ppo_minibatch_size=args.ppo_minibatch_size,
         ppo_rollout_macro_steps=args.ppo_rollout_macro_steps,
@@ -574,8 +594,16 @@ def main():
     if args.weight_alpha_anneal_fraction <= 0.0:
         raise ValueError("--weight-alpha-anneal-fraction must be positive")
     rng = np.random.default_rng(args.seed)
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = bool(args.deterministic)
+    torch.use_deterministic_algorithms(bool(args.deterministic))
+    args.cublas_workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    args.pythonhashseed = os.environ.get("PYTHONHASHSEED")
 
     env, low_level_backend, t_role = build_env(args)
     eval_env, eval_backend, eval_t_role = build_env(args)

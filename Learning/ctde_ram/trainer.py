@@ -283,6 +283,7 @@ class CTDERAMTrainer:
         n_attn_layers: int = 1,
         attn_ff_dim: int = 128,
         preference_role_bias: bool = False,
+        hard_role_preference_conditioning: str = "film",
         ppo_epochs: int = 4,
         ppo_minibatch_size: int = 128,
         ppo_rollout_macro_steps: int = 1024,
@@ -371,6 +372,13 @@ class CTDERAMTrainer:
         self.obs_shape = tuple(obs_shape)
         self.obs_dim_flat = int(np.prod(self.obs_shape))
         self.main_hard_role_mode = ram_mode in {"ppo_ram", "hard_role_q"}
+        self.hard_role_preference_conditioning = str(
+            hard_role_preference_conditioning
+        ).lower()
+        if self.hard_role_preference_conditioning not in {"film", "pref_token"}:
+            raise ValueError(
+                "hard_role_preference_conditioning must be one of: film, pref_token"
+            )
         if self.main_hard_role_mode:
             if self.K != 2:
                 raise ValueError("PPO-RAM and HardRoleQ-RAM currently require K=2 roles")
@@ -495,6 +503,7 @@ class CTDERAMTrainer:
         trunk_args = dict(
             d_model=d_model, n_heads=n_attn_heads, n_layers=n_attn_layers,
             ff_dim=attn_ff_dim, preference_role_bias=preference_role_bias,
+            preference_conditioning=self.hard_role_preference_conditioning,
         )
         self.ppo_actor = self.ppo_critic = self.ppo_learner = self.ppo_rollout = None
         self.hard_role_q = self.hard_role_q_learner = self.hard_role_replay = None

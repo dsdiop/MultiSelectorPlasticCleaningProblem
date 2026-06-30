@@ -2,7 +2,8 @@
 
 The two supported methods share the exact token architecture:
 3-channel allocentric map CNN + previous-role embedding + budget projection,
-preference FiLM, and Transformer-style fleet self-attention.
+selectable preference FiLM/preference token, and Transformer-style fleet
+self-attention.
 """
 from __future__ import annotations
 
@@ -83,13 +84,26 @@ class HardRoleAttentionTrunk(nn.Module):
     def __init__(
         self, d_model=64, n_heads=4, n_layers=1, ff_dim=128,
         preference_role_bias: bool = False,
+        preference_conditioning: str = "film",
     ):
         super().__init__()
         self.d_model = int(d_model)
+        self.preference_conditioning = str(preference_conditioning).lower()
+        if self.preference_conditioning not in {"film", "pref_token"}:
+            raise ValueError("preference_conditioning must be one of: film, pref_token")
+        if self.preference_conditioning == "pref_token" and int(n_layers) < 2:
+            raise ValueError("pref_token preference conditioning requires n_layers >= 2")
         self.map_cnn = AllocentricMapCNN(d_model)
         self.previous_role_embedding = nn.Embedding(2, d_model)
         self.budget_projection = nn.Linear(1, d_model)
-        self.preference_film = PreferenceFiLM(2, d_model)
+        self.preference_film = (
+            PreferenceFiLM(2, d_model)
+            if self.preference_conditioning == "film" else None
+        )
+        self.preference_projection = (
+            nn.Linear(2, d_model)
+            if self.preference_conditioning == "pref_token" else None
+        )
         self.layers = nn.ModuleList([
             AttentionEncoderLayer(d_model, n_heads, ff_dim) for _ in range(n_layers)
         ])
@@ -124,8 +138,15 @@ class HardRoleAttentionTrunk(nn.Module):
         else:
             raise ValueError(f"Budget must be [B,1], [B,N], or [B,N,1], got {tuple(budget.shape)}")
         token = z + role_z + budget_z
-        gamma, beta = self.preference_film(preference)
-        token = gamma.unsqueeze(1) * token + beta.unsqueeze(1)
+        if self.preference_conditioning == "film":
+            gamma, beta = self.preference_film(preference)
+            token = gamma.unsqueeze(1) * token + beta.unsqueeze(1)
+        else:
+            normalized_preference = preference / preference.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-8)
+            preference_token = self.preference_projection(normalized_preference).unsqueeze(1)
+            token = torch.cat([token, preference_token], dim=1)
 
         attention = []
         for layer in self.layers:
@@ -134,6 +155,10 @@ class HardRoleAttentionTrunk(nn.Module):
                 attention.append(weights)
             else:
                 token = layer(token)
+        # The preference token participates in every attention layer but is not
+        # exposed to the per-agent actor/Q heads or fleet-pooled critic.
+        if self.preference_conditioning == "pref_token":
+            token = token[:, :n_agents, :]
         return token, attention
 
     def role_bias(self, preference: torch.Tensor):
