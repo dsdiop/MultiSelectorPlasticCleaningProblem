@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical
+from torch.distributions import Categorical, kl_divergence
 
 try:
     from .popart import PopArtNorm
@@ -277,6 +277,7 @@ class PPOMetrics:
     entropy: float
     approx_kl: float
     epochs_ran: int
+    diversity_loss: float = 0.0
 
 
 class PPORAMLearner:
@@ -288,6 +289,8 @@ class PPORAMLearner:
         critic_popart=False, popart_alpha=1e-3,
         advantage_scalarization="ws", scalarization_power=3.0,
         ewc_p=1.0,
+        d3po_diversity_coef: float = 0.1,
+        d3po_diversity_alpha: float = 0.5,
     ):
         self.actor, self.critic = actor, critic
         self.actor_optim = torch.optim.Adam(actor.parameters(), lr=actor_lr)
@@ -303,10 +306,15 @@ class PPORAMLearner:
         if self.critic_mode not in {"scalar", "vector"}:
             raise ValueError("critic_mode must be scalar or vector")
         self.advantage_scalarization = advantage_scalarization.lower()
-        if self.advantage_scalarization not in {"ws", "wp", "wpop", "ewc"}:
-            raise ValueError("advantage_scalarization must be one of: ws, wp, wpop, ewc")
-        if not self.vector_critic and self.advantage_scalarization != "ws":
+        if self.advantage_scalarization not in {"ws", "wp", "wpop", "ewc", "d3po"}:
+            raise ValueError("advantage_scalarization must be one of: ws, wp, wpop, ewc, d3po")
+        if not self.vector_critic and self.advantage_scalarization not in {"ws"}:
             raise ValueError("nonlinear advantage scalarization requires --ppo-critic-mode vector")
+        self.d3po_mode = (self.advantage_scalarization == "d3po")
+        if self.d3po_mode and not self.vector_critic:
+            raise ValueError("D3PO (advantage_scalarization='d3po') requires critic_mode='vector'")
+        self.d3po_diversity_coef = float(d3po_diversity_coef)
+        self.d3po_diversity_alpha = float(d3po_diversity_alpha)
         self.scalarization_power, self.ewc_p = float(scalarization_power), float(ewc_p)
         self.scalarization_eps = 1e-8
         self.critic_popart = bool(critic_popart)
@@ -374,6 +382,16 @@ class PPORAMLearner:
             pa.mu_sq = float(state.get("mu_sq", pa.mu_sq))
             pa.sigma = float(state.get("sigma", pa.sigma))
 
+    def _sample_distractor_preference(self, preference: torch.Tensor) -> torch.Tensor:
+        """Sample ω' for the D³PO diversity regularizer.
+
+        Adds Gaussian noise to ω and re-projects to the probability simplex, following
+        the D³PO paper (Algorithm 1: 'perturbing and re-normalizing ω').
+        """
+        noise = torch.randn_like(preference) * 0.3
+        w_prime = (preference + noise).clamp(min=0.0)
+        return w_prime / w_prime.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
     def update(self, rollout):
         if len(rollout) == 0:
             return None
@@ -391,12 +409,20 @@ class PPORAMLearner:
                 advantages[t] = gae
             returns = advantages + data["value"]
             if self.vector_critic:
-                advantages = self._scalarize_advantages(advantages, data["preference"])
+                if self.d3po_mode:
+                    # D³PO: per-objective standardization; keep as (T, K) for
+                    # independent per-objective PPO clipping (paper Algorithm 1).
+                    adv_mean = advantages.mean(dim=0, keepdim=True)
+                    adv_std = advantages.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
+                    advantages = (advantages - adv_mean) / adv_std
+                else:
+                    advantages = self._scalarize_advantages(advantages, data["preference"])
             else:
                 advantages = (advantages - advantages.mean()) / advantages.std(unbiased=False).clamp_min(1e-8)
             value_targets = self._normalize_value_targets(returns)
 
         metrics = []
+        diversity_losses = []
         count = len(advantages)
         epochs_ran = 0
         stop_early = False
@@ -408,15 +434,53 @@ class PPORAMLearner:
                 new_logp = dist.log_prob(data["roles"][idx]).sum(dim=-1)
                 ratio = (new_logp - data["old_logprob"][idx]).exp()
                 approx_kl = (data["old_logprob"][idx] - new_logp).mean()
-                unclipped = ratio * advantages[idx]
-                clipped = ratio.clamp(1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages[idx]
-                policy_loss = -torch.min(unclipped, clipped).mean()
                 entropy = dist.entropy().mean()
                 value = self.critic(data["maps"][idx], data["previous_roles"][idx], data["budget"][idx], data["preference"][idx])
                 value_loss = F.mse_loss(value, value_targets[idx])
 
+                if self.d3po_mode:
+                    # D³PO actor loss (paper Algorithm 1 / eq. for L_actor):
+                    #
+                    # 1. Per-objective PPO surrogate: clip each advantage stream
+                    #    independently before applying preference weights.
+                    # 2. Late-stage weighting: multiply the already-clipped per-
+                    #    objective losses by ω_i, then sum and mean.
+                    # 3. Diversity regularizer: enforce KL(π(s,ω) || π(s,ω')) ≈
+                    #    α*||ω-ω'||_1 as a Lipschitz-continuity constraint.
+                    adv_per_obj = advantages[idx]          # (B, K)
+                    pref_w = data["preference"][idx]       # (B, K)
+                    pref_w = pref_w / pref_w.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+                    ratio_bc = ratio.unsqueeze(-1)         # (B, 1) → broadcasts to (B, K)
+                    unclipped = ratio_bc * adv_per_obj
+                    clipped   = ratio_bc.clamp(1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_per_obj
+                    # Late-stage weighting: apply ω after clipping (D³PO eq. L_actor)
+                    L_clip_per_obj = torch.min(unclipped, clipped)   # (B, K)
+                    policy_loss = -(pref_w * L_clip_per_obj).sum(dim=-1).mean()
+
+                    # Diversity regularizer L_diversity = E[(KL(π_ω || π_ω') - α*||ω-ω'||_1)²]
+                    pref_distractor = self._sample_distractor_preference(pref_w)   # (B, K)
+                    logits_prime = self.actor(
+                        data["maps"][idx], data["previous_roles"][idx],
+                        data["budget"][idx], pref_distractor,
+                    )
+                    dist_prime = Categorical(logits=logits_prime)
+                    # Sum over N agents (joint KL under independence); shape (B,)
+                    kl_joint  = kl_divergence(dist, dist_prime).sum(dim=-1)
+                    pref_l1   = (pref_w - pref_distractor).abs().sum(dim=-1)       # (B,)
+                    diversity_loss = ((kl_joint - self.d3po_diversity_alpha * pref_l1) ** 2).mean()
+
+                    actor_total = policy_loss - self.entropy_coef * entropy + self.d3po_diversity_coef * diversity_loss
+                    diversity_losses.append(float(diversity_loss.item()))
+                else:
+                    unclipped = ratio * advantages[idx]
+                    clipped = ratio.clamp(1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages[idx]
+                    policy_loss = -torch.min(unclipped, clipped).mean()
+                    actor_total = policy_loss - self.entropy_coef * entropy
+                    diversity_loss = torch.zeros(1, device=self.device).squeeze()
+
                 self.actor_optim.zero_grad()
-                (policy_loss - self.entropy_coef * entropy).backward()
+                actor_total.backward()
                 nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 self.actor_optim.step()
                 self.critic_optim.zero_grad()
@@ -435,7 +499,8 @@ class PPORAMLearner:
                 break
         rollout.clear()
         mean = np.asarray(metrics).mean(axis=0)
-        return PPOMetrics(*map(float, mean), epochs_ran=epochs_ran)
+        mean_diversity = float(np.mean(diversity_losses)) if diversity_losses else 0.0
+        return PPOMetrics(*map(float, mean), epochs_ran=epochs_ran, diversity_loss=mean_diversity)
 
 
 class HardRoleQLearner:

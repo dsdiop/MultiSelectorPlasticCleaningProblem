@@ -299,6 +299,8 @@ class CTDERAMTrainer:
         ppo_advantage_scalarization: str = "ws",
         ppo_target_kl: float = 0.02,
         ppo_max_grad_norm: float = 0.5,
+        d3po_diversity_coef: float = 0.1,
+        d3po_diversity_alpha: float = 0.5,
         role_q_lr: float = 3e-4,
         role_q_target_update: int = 50,
         role_q_mixer: str = "none",
@@ -392,6 +394,8 @@ class CTDERAMTrainer:
                 )
             if role_q_mixer not in {"none", "qmix"}:
                 raise ValueError("role_q_mixer must be one of: none, qmix")
+        self.d3po_diversity_coef = float(d3po_diversity_coef)
+        self.d3po_diversity_alpha = float(d3po_diversity_alpha)
         self.per_beta_start, self.per_beta_end = float(per_beta_start), float(per_beta_end)
         self.per_beta_progress = 0
         self.hard_role_gamma = self.gamma if role_q_gamma is None else float(role_q_gamma)
@@ -409,6 +413,16 @@ class CTDERAMTrainer:
                 "delta_metrics with a vector PPO critic requires --ppo-critic-popart "
                 "so each objective return is normalized independently"
             )
+        if ram_mode == "ppo_ram" and self.ppo_advantage_scalarization == "d3po":
+            if self.ppo_critic_mode != "vector":
+                raise ValueError(
+                    "D3PO (--ppo-advantage-scalarization d3po) requires --ppo-critic-mode vector"
+                )
+            if not self.ppo_critic_popart:
+                raise ValueError(
+                    "D3PO (--ppo-advantage-scalarization d3po) requires --ppo-critic-popart "
+                    "so each objective's return is normalized on its own scale"
+                )
         if self.main_hard_role_mode and ram_mode == "ppo_ram" and self.ppo_rollout_macro_steps <= 0:
             raise ValueError("ppo_rollout_macro_steps must be positive")
 
@@ -539,6 +553,8 @@ class CTDERAMTrainer:
                 advantage_scalarization=self.ppo_advantage_scalarization,
                 scalarization_power=self.scalarization_power,
                 ewc_p=self.ewc_p,
+                d3po_diversity_coef=self.d3po_diversity_coef,
+                d3po_diversity_alpha=self.d3po_diversity_alpha,
             )
         elif self.ram_mode == "hard_role_q":
             self.hard_role_q = HardRoleQNetwork(**trunk_args).to(self.device)
@@ -1515,6 +1531,8 @@ class CTDERAMTrainer:
                 self.tb.log_step("train/ppo_entropy", update.entropy)
                 self.tb.log_step("train/ppo_approx_kl", update.approx_kl)
                 self.tb.log_step("train/ppo_epochs_ran", update.epochs_ran)
+                if self.ppo_advantage_scalarization == "d3po":
+                    self.tb.log_step("train/ppo_d3po_diversity_loss", update.diversity_loss)
 
         denom = max(float(role_counts.sum()), 1.0)
         metrics = {
@@ -1549,6 +1567,8 @@ class CTDERAMTrainer:
             self.tb.log_step("train/ppo_value_loss", update.value_loss)
             self.tb.log_step("train/ppo_entropy", update.entropy)
             self.tb.log_step("train/ppo_approx_kl", update.approx_kl)
+            if self.ppo_advantage_scalarization == "d3po":
+                self.tb.log_step("train/ppo_d3po_diversity_loss", update.diversity_loss)
         return update
 
     # ---------- one training episode ----------
@@ -2452,6 +2472,8 @@ class CTDERAMTrainer:
                 "ppo_critic_mode": self.ppo_critic_mode,
                 "ppo_critic_popart": self.ppo_critic_popart,
                 "ppo_advantage_scalarization": self.ppo_advantage_scalarization,
+                "d3po_diversity_coef": self.d3po_diversity_coef,
+                "d3po_diversity_alpha": self.d3po_diversity_alpha,
                 "hard_role_preference_conditioning": self.hard_role_preference_conditioning,
                 "hard_role_deep_input_projections": self.hard_role_deep_input_projections,
                 "ram_reward_mode": self.ram_reward_mode,

@@ -318,8 +318,24 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--ppo-advantage-scalarization",
-        choices=["ws", "wp", "wpop", "ewc"], default="ws",
-        help="How vector GAE advantages are combined for the PPO actor update.",
+        choices=["ws", "wp", "wpop", "ewc", "d3po"], default="ws",
+        help=(
+            "How vector GAE advantages are combined for the PPO actor update. "
+            "'d3po' enables D³PO: per-objective PPO clip, late-stage preference weighting, "
+            "and a diversity regularizer (requires --ppo-critic-mode vector --ppo-critic-popart)."
+        ),
+    )
+    p.add_argument(
+        "--d3po-diversity-coef",
+        type=float,
+        default=0.1,
+        help="D³PO diversity regularizer coefficient λ_div (paper: robust across 0.01–1.0).",
+    )
+    p.add_argument(
+        "--d3po-diversity-alpha",
+        type=float,
+        default=0.5,
+        help="D³PO diversity target scale α: target KL = α * ||ω-ω'||_1 (paper: 0.1–1.0).",
     )
     p.add_argument("--ppo-target-kl", type=float, default=0.02)
     p.add_argument("--ppo-max-grad-norm", type=float, default=0.5)
@@ -579,6 +595,8 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         ppo_advantage_scalarization=args.ppo_advantage_scalarization,
         ppo_target_kl=args.ppo_target_kl,
         ppo_max_grad_norm=args.ppo_max_grad_norm,
+        d3po_diversity_coef=args.d3po_diversity_coef,
+        d3po_diversity_alpha=args.d3po_diversity_alpha,
         role_q_lr=args.role_q_lr,
         role_q_target_update=args.role_q_target_update,
         role_q_mixer=args.role_q_mixer,
