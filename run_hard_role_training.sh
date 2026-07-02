@@ -283,11 +283,34 @@ if [[ "${HARD_ROLE_DEEP_INPUT_PROJECTIONS}" == "1" ]]; then
     METHOD_TAG="${METHOD_TAG}_DeepInputProj"
 fi
 
-RUN_NAME="${MAP_NAME}_F4_${METHOD_TAG}_T${RUN_T_ROLE}_ep${EPISODES}_beta${WEIGHT_ALPHA}_s${SEED}"
-SESSION_NAME="${RUN_NAME}"
+RUN_NAME_BASE="${MAP_NAME}_F4_${METHOD_TAG}_T${RUN_T_ROLE}_ep${EPISODES}_beta${WEIGHT_ALPHA}_s${SEED}"
 LOG_DIR="${PROJECT_ROOT}/${OUTPUT_DIR}/_tmux_logs"
-LOG_FILE="${LOG_DIR}/${RUN_NAME}.log"
-CMD_FILE="${LOG_DIR}/${RUN_NAME}.cmd.sh"
+
+# Resolve the run suffix before naming any artifact. Python also protects its
+# output directory against collisions, but doing it only there leaves tmux,
+# logs, and command files using the unsuffixed name. tmux maps dots in session
+# names to underscores, so use that normalized form consistently when checking.
+RUN_SUFFIX=0
+while true; do
+    if (( RUN_SUFFIX == 0 )); then
+        RUN_NAME="${RUN_NAME_BASE}"
+    else
+        RUN_NAME="${RUN_NAME_BASE}_${RUN_SUFFIX}"
+    fi
+    SESSION_NAME="${RUN_NAME//./_}"
+    RUN_DIR="${PROJECT_ROOT}/${OUTPUT_DIR}/${RUN_NAME}"
+    LOG_FILE="${LOG_DIR}/${RUN_NAME}.log"
+    CMD_FILE="${LOG_DIR}/${RUN_NAME}.cmd.sh"
+
+    SESSION_EXISTS=0
+    if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=${SESSION_NAME}" 2>/dev/null; then
+        SESSION_EXISTS=1
+    fi
+    if [[ ! -e "${RUN_DIR}" && ! -e "${LOG_FILE}" && ! -e "${CMD_FILE}" && "${SESSION_EXISTS}" == "0" ]]; then
+        break
+    fi
+    RUN_SUFFIX=$((RUN_SUFFIX + 1))
+done
 
 # ---- Preflight ---------------------------------------------------------------
 
