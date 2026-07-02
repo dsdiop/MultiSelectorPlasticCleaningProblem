@@ -2037,6 +2037,7 @@ class CTDERAMTrainer:
         If these columns are flat from w=(1,0) to w=(0,1), the selector is not
         preference-sensitive even if a Pareto/hypervolume number looks decent.
         """
+        _progress_write("[probe] starting preference sensitivity")
         if scal_grid is None:
             scal_grid = [(1.0, 0.0), (0.75, 0.25), (0.5, 0.5), (0.25, 0.75), (0.0, 1.0)]
 
