@@ -24,6 +24,8 @@ set -euo pipefail
 #   PPOT1WPOPPrefToken  PPO T1, WPOP reward, preference token, two attention layers
 #   PPOT1VectorCriticAdvWPOP  PPO T1, vector critic, PopArt, WPOP advantages, FiLM
 #   PPOT1VectorCriticDeltaAdvWPOP  same vector PPO using raw mission-metric deltas
+#   PPOT1D3PODelta  D3PO with delta metrics, vector critic, PopArt, and diversity loss
+#   PPOT1D3POComponents  same D3PO setup using component rewards
 #   PPOT1VectorWPOP  short alias for PPOT1VectorCriticAdvWPOP
 #   PPOT1VectorWPOPToken  PPO T1 with vector critic, WPOP advantages, preference token and two attention layers, no popart
 #   PPOT1WP          PPO T1 with WP role-reward scalarization,
@@ -94,6 +96,9 @@ EVAL_POINTS="${EVAL_POINTS:-20}"
 PROBE_POINTS="${PROBE_POINTS:-20}"
 PROBE_EPISODES="${PROBE_EPISODES:-100}"
 WEIGHT_ALPHA="${WEIGHT_ALPHA:-0.4}"
+D3PO_DIVERSITY_COEF="${D3PO_DIVERSITY_COEF:-0.1}"
+D3PO_DIVERSITY_ALPHA="${D3PO_DIVERSITY_ALPHA:-0.5}"
+ENTROPY_COEF="${ENTROPY_COEF:-0.03}"
 DRY_RUN="${DRY_RUN:-0}"
 CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 PYTHONHASHSEED="${PYTHONHASHSEED:-${SEED}}"
@@ -104,6 +109,9 @@ N_ATTN_HEADS="${N_ATTN_HEADS:-4}"
 N_ATTN_LAYERS="${N_ATTN_LAYERS:-1}"
 ATTN_FF_DIM="${ATTN_FF_DIM:-128}"
 HARD_ROLE_PREFERENCE_CONDITIONING="${HARD_ROLE_PREFERENCE_CONDITIONING:-film}"
+PPO_MINIBATCH_SIZE="${PPO_MINIBATCH_SIZE:-256}"
+PPO_ROLLOUT_MACRO_STEPS="${PPO_ROLLOUT_MACRO_STEPS:-2048}"
+DETERMINISTIC="${DETERMINISTIC:-1}"
 
 # ---- Resolve experiment ------------------------------------------------------
 
@@ -175,6 +183,36 @@ case "${EXP}" in
         PPO_CRITIC_MODE="vector"
         PPO_CRITIC_POPART=1
         PPO_ADVANTAGE_SCALARIZATION="wpop"
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1d3po|ppo_t1_d3po|d3po|ppot1d3podelta|ppo_t1_d3po_delta|d3podelta|d3po_delta)
+        METHOD_TAG="PPO_RAM_FiLM_Attn_T1_D3PO_VectorCritic_PopArt_DeltaMetrics_Fair2048"
+        RUN_T_ROLE=1
+        RAM_REWARD_MODE="delta_metrics"
+        PPO_CRITIC_MODE="vector"
+        PPO_CRITIC_POPART=1
+        PPO_ADVANTAGE_SCALARIZATION="d3po"
+        HARD_ROLE_PREFERENCE_CONDITIONING="film"
+        HARD_ROLE_DEEP_INPUT_PROJECTIONS=0
+        PPO_MINIBATCH_SIZE=256
+        PPO_ROLLOUT_MACRO_STEPS=2048
+        DETERMINISTIC=1
+        EXTRA_ARGS=(--d3po-diversity-coef "${D3PO_DIVERSITY_COEF}" --d3po-diversity-alpha "${D3PO_DIVERSITY_ALPHA}")
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1d3pocomponents|ppo_t1_d3po_components|d3pocomponents|d3po_components)
+        METHOD_TAG="PPO_RAM_FiLM_Attn_T1_D3PO_VectorCritic_PopArt_ComponentRewards_Fair2048"
+        RUN_T_ROLE=1
+        RAM_REWARD_MODE="component_rewards"
+        PPO_CRITIC_MODE="vector"
+        PPO_CRITIC_POPART=1
+        PPO_ADVANTAGE_SCALARIZATION="d3po"
+        HARD_ROLE_PREFERENCE_CONDITIONING="film"
+        HARD_ROLE_DEEP_INPUT_PROJECTIONS=0
+        PPO_MINIBATCH_SIZE=256
+        PPO_ROLLOUT_MACRO_STEPS=2048
+        DETERMINISTIC=1
+        EXTRA_ARGS=(--d3po-diversity-coef "${D3PO_DIVERSITY_COEF}" --d3po-diversity-alpha "${D3PO_DIVERSITY_ALPHA}")
         MODE_ARGS=(--ram-mode ppo_ram)
         ;;
     ppot1vectorwpoptoken|ppo_t1_vector_wpop_token)
@@ -359,11 +397,11 @@ COMMON_ARGS=(
     --attn-ff-dim "${ATTN_FF_DIM}"
     --hard-role-preference-conditioning "${HARD_ROLE_PREFERENCE_CONDITIONING}"
     --ppo-epochs 4
-    --ppo-minibatch-size 256
-    --ppo-rollout-macro-steps 2048
+    --ppo-minibatch-size "${PPO_MINIBATCH_SIZE}"
+    --ppo-rollout-macro-steps "${PPO_ROLLOUT_MACRO_STEPS}"
     --ppo-clip-eps 0.1
     --gae-lambda 0.95
-    --entropy-coef 0.03
+    --entropy-coef "${ENTROPY_COEF}"
     --value-coef 0.5
     --actor-lr 0.0001
     --critic-lr 0.0001
@@ -404,6 +442,9 @@ fi
 if [[ "${HARD_ROLE_DEEP_INPUT_PROJECTIONS}" == "1" ]]; then
     COMMON_ARGS+=(--hard-role-deep-input-projections)
 fi
+if [[ "${DETERMINISTIC}" == "0" ]]; then
+    COMMON_ARGS+=(--no-deterministic)
+fi
 
 {
     echo "#!/usr/bin/env bash"
@@ -426,7 +467,7 @@ echo "[launch] T_role     : ${RUN_T_ROLE}"
 echo "[launch] critic     : ${PPO_CRITIC_MODE} (popart=${PPO_CRITIC_POPART})"
 echo "[launch] advantage  : ${PPO_ADVANTAGE_SCALARIZATION}"
 echo "[launch] deep input : ${HARD_ROLE_DEEP_INPUT_PROJECTIONS}"
-echo "[launch] deterministic: strict (CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG})"
+echo "[launch] deterministic: ${DETERMINISTIC} (CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG})"
 echo "[launch] episodes   : ${EPISODES}"
 echo "[launch] tmux       : ${SESSION_NAME}"
 echo "[launch] log        : ${LOG_FILE}"
