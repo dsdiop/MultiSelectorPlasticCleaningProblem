@@ -1343,14 +1343,14 @@ class CTDERAMTrainer:
     def _select_main_hard_roles(self, obs_all, previous_roles, scal_weights, epsilon=0.0, training=True, return_attn=False):
         maps, previous, budget, preference = self._hard_role_state(obs_all, previous_roles, scal_weights)
         if self.ram_mode == "ppo_ram":
-            roles, logprob, probs, attn = self.ppo_actor.act(
+            roles, logprob, probs, attn, logits = self.ppo_actor.act(
                 maps, previous, budget, preference,
                 deterministic=not training, return_attn=return_attn,
+                return_logits=True,
             )
             value = self.ppo_learner.denormalize_values(
                 self.ppo_critic(maps, previous, budget, preference)
             )
-            logits = self.ppo_actor(maps, previous, budget, preference)
             if not torch.isfinite(logits).all() or not torch.isfinite(value).all():
                 raise FloatingPointError("Non-finite PPO role logits or critic value")
             return roles[0], {"logprob": logprob[0], "value": value[0], "scores": logits[0], "probs": probs[0], "attn": attn}
@@ -2043,9 +2043,20 @@ class CTDERAMTrainer:
         if self.main_hard_role_mode:
             rows, attention_records = [], []
             seed_base = self.seed if episode_seed_base is None else int(episode_seed_base)
-            for scal_weights in scal_grid:
+            for scal_weights in _progress(
+                list(scal_grid),
+                desc="probe weights",
+                unit="w",
+                leave=False,
+            ):
                 episode_rows = []
-                for episode_i in range(int(n_episodes_per_w)):
+                weight_label = ",".join(f"{float(x):.2f}" for x in scal_weights)
+                for episode_i in _progress(
+                    range(int(n_episodes_per_w)),
+                    desc=f"probe episodes w=({weight_label})",
+                    unit="ep",
+                    leave=False,
+                ):
                     records = attention_records if episode_i == 0 else None
                     episode_rows.append(self._run_hard_role_episode(
                         env, scal_weights, 0.0, 0.0, training=False,

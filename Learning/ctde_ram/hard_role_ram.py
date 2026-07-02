@@ -192,13 +192,17 @@ class PPOActor(nn.Module):
         logits = self.role_head(h) + self.trunk.role_bias(preference)
         return (logits, attn) if return_attn else logits
 
-    def act(self, maps, previous_roles, budget, preference, deterministic=False, return_attn=False):
+    def act(
+        self, maps, previous_roles, budget, preference, deterministic=False,
+        return_attn=False, return_logits=False,
+    ):
         result = self.forward(maps, previous_roles, budget, preference, return_attn)
         logits, attn = result if return_attn else (result, None)
         dist = Categorical(logits=logits)
         roles = logits.argmax(dim=-1) if deterministic else dist.sample()
         logprob = dist.log_prob(roles).sum(dim=-1)
-        return roles, logprob, dist.probs, attn
+        output = (roles, logprob, dist.probs, attn)
+        return (*output, logits) if return_logits else output
 
 
 class PPOCritic(nn.Module):
@@ -423,18 +427,34 @@ class PPORAMLearner:
 
         metrics = []
         diversity_losses = []
+        rejected_kl = None
+        rejected_entropy = None
         count = len(advantages)
         epochs_ran = 0
         stop_early = False
         for _ in range(self.epochs):
-            epoch_kls = []
+            epochs_ran += 1
             for idx in torch.randperm(count, device=self.device).split(self.minibatch_size):
                 logits = self.actor(data["maps"][idx], data["previous_roles"][idx], data["budget"][idx], data["preference"][idx])
                 dist = Categorical(logits=logits)
                 new_logp = dist.log_prob(data["roles"][idx]).sum(dim=-1)
-                ratio = (new_logp - data["old_logprob"][idx]).exp()
-                approx_kl = (data["old_logprob"][idx] - new_logp).mean()
-                entropy = dist.entropy().mean()
+                log_ratio = new_logp - data["old_logprob"][idx]
+                ratio = log_ratio.exp()
+                # Schulman's k3 estimator: non-negative and lower variance than
+                # E[log pi_old - log pi_new] for finite minibatches.
+                approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                if not torch.isfinite(approx_kl):
+                    raise FloatingPointError("Non-finite PPO approximate KL")
+                entropy = dist.entropy().sum(dim=-1).mean()
+                # Stop before applying either optimizer update for an excessive
+                # minibatch, matching the conservative SB3 target-KL guard.
+                if self.target_kl is not None and approx_kl.item() > 1.5 * self.target_kl:
+                    rejected_kl = float(approx_kl.item())
+                    rejected_entropy = float(entropy.item())
+                    stop_early = True
+                    break
+                # The joint policy factorizes over agents, so its entropy is
+                # the sum of per-agent entropies, averaged over the minibatch.
                 value = self.critic(data["maps"][idx], data["previous_roles"][idx], data["budget"][idx], data["preference"][idx])
                 value_loss = F.mse_loss(value, value_targets[idx])
 
@@ -491,14 +511,14 @@ class PPORAMLearner:
                 if not all(torch.isfinite(x) for x in (total, policy_loss, value_loss, entropy, approx_kl)):
                     raise FloatingPointError("Non-finite PPO loss/statistic")
                 metrics.append((total.item(), policy_loss.item(), value_loss.item(), entropy.item(), approx_kl.item()))
-                epoch_kls.append(max(float(approx_kl.item()), 0.0))
-            epochs_ran += 1
-            if self.target_kl is not None and epoch_kls and np.mean(epoch_kls) > self.target_kl:
-                stop_early = True
             if stop_early:
                 break
         rollout.clear()
-        mean = np.asarray(metrics).mean(axis=0)
+        mean = (
+            np.asarray(metrics).mean(axis=0)
+            if metrics else
+            np.asarray([0.0, 0.0, 0.0, rejected_entropy or 0.0, rejected_kl or 0.0])
+        )
         mean_diversity = float(np.mean(diversity_losses)) if diversity_losses else 0.0
         return PPOMetrics(*map(float, mean), epochs_ran=epochs_ran, diversity_loss=mean_diversity)
 
