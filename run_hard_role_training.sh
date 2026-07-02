@@ -99,6 +99,13 @@ WEIGHT_ALPHA="${WEIGHT_ALPHA:-0.4}"
 D3PO_DIVERSITY_COEF="${D3PO_DIVERSITY_COEF:-0.1}"
 D3PO_DIVERSITY_ALPHA="${D3PO_DIVERSITY_ALPHA:-0.5}"
 ENTROPY_COEF="${ENTROPY_COEF:-0.03}"
+CHEBYSHEV_REF_CLEAN="${CHEBYSHEV_REF_CLEAN:-1.0}"
+CHEBYSHEV_REF_COV="${CHEBYSHEV_REF_COV:-1.0}"
+CHEBYSHEV_RHO="${CHEBYSHEV_RHO:-0.05}"
+REF_AUTOCALIBRATE="${REF_AUTOCALIBRATE:-0}"
+STCH_MU="${STCH_MU:-0.1}"
+WPOP_EPS="${WPOP_EPS:-0.01}"
+PREF_WEIGHT_CLAMP="${PREF_WEIGHT_CLAMP:-0.05}"
 DRY_RUN="${DRY_RUN:-0}"
 CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 PYTHONHASHSEED="${PYTHONHASHSEED:-${SEED}}"
@@ -166,6 +173,29 @@ case "${EXP}" in
         METHOD_TAG="PPO_RAM_FiLM_Attn_T1_WP"
         RUN_T_ROLE=1
         ROLE_SCALARIZATION="wp"
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1chebyshev|ppo_t1_chebyshev|chebyshev_terminal)
+        METHOD_TAG="PPO_RAM_FiLM_Attn_T1_ChebyshevTerminal"
+        RUN_T_ROLE=1
+        RAM_REWARD_MODE="chebyshev_terminal"
+        PPO_CRITIC_MODE="scalar"
+        PPO_CRITIC_POPART=0
+        PPO_ADVANTAGE_SCALARIZATION="ws"
+        HARD_ROLE_PREFERENCE_CONDITIONING="film"
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1chebyshevautopreftoken|ppo_t1_chebyshev_auto_pref_token|chebyshev_augmented_terminal)
+        METHOD_TAG="PPO_RAM_PrefToken_AttnL2_T1_ChebyshevAugTerminal_AutoRef"
+        RUN_T_ROLE=1
+        RAM_REWARD_MODE="chebyshev_augmented_terminal"
+        PPO_CRITIC_MODE="scalar"
+        PPO_CRITIC_POPART=0
+        PPO_ADVANTAGE_SCALARIZATION="ws"
+        HARD_ROLE_PREFERENCE_CONDITIONING="pref_token"
+        N_ATTN_LAYERS=2
+        HARD_ROLE_DEEP_INPUT_PROJECTIONS=1
+        REF_AUTOCALIBRATE=1
         MODE_ARGS=(--ram-mode ppo_ram)
         ;;
     ppot1vectorwpop|ppo_t1_vector_wpop|ppot1vectorcriticadvwpop|ppo_t1_vector_critic_adv_wpop)
@@ -391,6 +421,12 @@ COMMON_ARGS=(
     --role-reward-norm minmax
     --role-scalarization "${ROLE_SCALARIZATION}"
     --ram-reward-mode "${RAM_REWARD_MODE}"
+    --chebyshev-ref-clean "${CHEBYSHEV_REF_CLEAN}"
+    --chebyshev-ref-cov "${CHEBYSHEV_REF_COV}"
+    --chebyshev-rho "${CHEBYSHEV_RHO}"
+    --stch-mu "${STCH_MU}"
+    --wpop-eps "${WPOP_EPS}"
+    --pref-weight-clamp "${PREF_WEIGHT_CLAMP}"
     --d-model "${D_MODEL}"
     --n-attn-heads "${N_ATTN_HEADS}"
     --n-attn-layers "${N_ATTN_LAYERS}"
@@ -438,6 +474,9 @@ COMMON_ARGS=(
 
 if [[ "${PPO_CRITIC_POPART}" == "1" ]]; then
     COMMON_ARGS+=(--ppo-critic-popart)
+fi
+if [[ "${REF_AUTOCALIBRATE}" == "1" ]]; then
+    COMMON_ARGS+=(--ref-autocalibrate)
 fi
 if [[ "${HARD_ROLE_DEEP_INPUT_PROJECTIONS}" == "1" ]]; then
     COMMON_ARGS+=(--hard-role-deep-input-projections)

@@ -295,6 +295,11 @@ class PPORAMLearner:
         ewc_p=1.0,
         d3po_diversity_coef: float = 0.1,
         d3po_diversity_alpha: float = 0.5,
+        ram_reward_mode: str = "component_rewards",
+        ref_clean: float = 1.0, ref_cov: float = 1.0,
+        ref_autocalibrate: bool = False, chebyshev_rho: float = 0.05,
+        stch_mu: float = 0.1, wpop_eps: float = 0.01,
+        pref_weight_clamp: float = 0.05,
     ):
         self.actor, self.critic = actor, critic
         self.actor_optim = torch.optim.Adam(actor.parameters(), lr=actor_lr)
@@ -319,6 +324,16 @@ class PPORAMLearner:
             raise ValueError("D3PO (advantage_scalarization='d3po') requires critic_mode='vector'")
         self.d3po_diversity_coef = float(d3po_diversity_coef)
         self.d3po_diversity_alpha = float(d3po_diversity_alpha)
+        self.ram_reward_mode = str(ram_reward_mode)
+        self.ref_clean = self.running_ref_clean = float(ref_clean)
+        self.ref_cov = self.running_ref_cov = float(ref_cov)
+        self.ref_autocalibrate = bool(ref_autocalibrate)
+        self.chebyshev_rho = float(chebyshev_rho)
+        self.stch_mu = float(stch_mu)
+        self.wpop_eps = float(wpop_eps)
+        self.pref_weight_clamp = float(pref_weight_clamp)
+        self.last_utility_ref = (self.running_ref_clean, self.running_ref_cov)
+        self.last_terminal_utilities = []
         self.scalarization_power, self.ewc_p = float(scalarization_power), float(ewc_p)
         self.scalarization_eps = 1e-8
         self.critic_popart = bool(critic_popart)
@@ -400,6 +415,47 @@ class PPORAMLearner:
         if len(rollout) == 0:
             return None
         data = rollout.as_tensors(self.device)
+        terminal_modes = {
+            "chebyshev_terminal", "chebyshev_augmented_terminal",
+            "wpop_terminal", "stch_terminal",
+        }
+        if self.ram_reward_mode in terminal_modes:
+            terminal = data["done"] > 0.5
+            if terminal.any():
+                clean = data["terminal_clean"][terminal]
+                cov = data["terminal_cov"][terminal]
+                if not torch.isfinite(clean).all() or not torch.isfinite(cov).all():
+                    raise FloatingPointError("Missing terminal mission metrics for utility rollout")
+                if self.ref_autocalibrate and self.ram_reward_mode != "wpop_terminal":
+                    self.running_ref_clean = max(self.running_ref_clean, float(clean.max().item()))
+                    self.running_ref_cov = max(self.running_ref_cov, float(cov.max().item()))
+                ref_clean, ref_cov = self.running_ref_clean, self.running_ref_cov
+                self.last_utility_ref = (ref_clean, ref_cov)
+                w = data["preference"][terminal]
+                w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                if self.ram_reward_mode == "wpop_terminal":
+                    w = w.clamp(self.pref_weight_clamp, 1.0 - self.pref_weight_clamp)
+                    vals = torch.stack((clean, cov), dim=-1).clamp_min(self.wpop_eps)
+                    utility = torch.prod(vals.pow(w), dim=-1)
+                else:
+                    distances = torch.stack((
+                        (ref_clean - clean).clamp_min(0.0),
+                        (ref_cov - cov).clamp_min(0.0),
+                    ), dim=-1)
+                    terms = w * distances
+                    if self.ram_reward_mode == "stch_terminal":
+                        # Normalized smooth max: subtract log(K), so a perfect
+                        # outcome has utility exactly zero while retaining gradients.
+                        smooth_max = self.stch_mu * (
+                            torch.logsumexp(terms / self.stch_mu, dim=-1)
+                            - np.log(terms.shape[-1])
+                        )
+                        utility = -smooth_max
+                    else:
+                        utility = -(terms.max(dim=-1).values + self.chebyshev_rho * terms.sum(dim=-1))
+                data["reward"].zero_()
+                data["reward"][terminal] = utility
+                self.last_terminal_utilities = utility.detach().cpu().tolist()
         with torch.no_grad():
             next_values = self.denormalize_values(self.critic(data["next_maps"], data["next_previous_roles"], data["next_budget"], data["preference"]))
             discounts = self.gamma ** data["duration"]

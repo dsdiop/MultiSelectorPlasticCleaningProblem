@@ -170,7 +170,7 @@ class PPORoleRolloutBuffer:
     FIELDS = (
         "maps", "preference", "previous_roles", "roles", "old_logprob", "value",
         "reward", "done", "duration", "budget", "next_maps",
-        "next_previous_roles", "next_budget",
+        "next_previous_roles", "next_budget", "terminal_clean", "terminal_cov",
     )
 
     def __init__(self):
@@ -204,8 +204,10 @@ class PPORoleRolloutBuffer:
         self.clear()
         if not state:
             return
+        size = len(state.get("reward", []))
         for name in self.FIELDS:
-            self.data[name] = [np.asarray(value).copy() for value in state.get(name, [])]
+            default = [np.asarray(np.nan)] * size if name in {"terminal_clean", "terminal_cov"} else []
+            self.data[name] = [np.asarray(value).copy() for value in state.get(name, default)]
 
 
 class PrioritizedHardRoleReplayBuffer:

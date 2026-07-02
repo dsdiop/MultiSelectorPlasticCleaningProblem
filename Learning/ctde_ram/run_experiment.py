@@ -255,10 +255,23 @@ def parse_args(argv=None):
     )
     p.add_argument(
         "--ram-reward-mode",
-        choices=["component_rewards", "delta_metrics"],
+        choices=[
+            "component_rewards", "delta_metrics", "chebyshev_terminal",
+            "chebyshev_augmented_terminal", "wpop_terminal", "stch_terminal",
+        ],
         default="component_rewards",
-        help="RAM reward source: per-step component rewards or mission-metric deltas over each role window.",
+        help=(
+            "RAM reward source: per-step component rewards, mission-metric deltas "
+            "per role window, or one terminal augmented-Chebyshev utility."
+        ),
     )
+    p.add_argument("--chebyshev-ref-clean", type=float, default=1.0)
+    p.add_argument("--chebyshev-ref-cov", type=float, default=1.0)
+    p.add_argument("--ref-autocalibrate", action="store_true")
+    p.add_argument("--chebyshev-rho", type=float, default=0.05)
+    p.add_argument("--stch-mu", type=float, default=0.1)
+    p.add_argument("--wpop-eps", type=float, default=0.01)
+    p.add_argument("--pref-weight-clamp", type=float, default=0.05)
     p.add_argument(
         "--q-scalarization",
         choices=["ws", "wp", "wpop", "ewc"],
@@ -574,6 +587,13 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         scalarization_power=args.scalarization_power,
         ewc_p=args.ewc_p,
         ram_reward_mode=args.ram_reward_mode,
+        chebyshev_ref_clean=args.chebyshev_ref_clean,
+        chebyshev_ref_cov=args.chebyshev_ref_cov,
+        ref_autocalibrate=args.ref_autocalibrate,
+        chebyshev_rho=args.chebyshev_rho,
+        stch_mu=args.stch_mu,
+        wpop_eps=args.wpop_eps,
+        pref_weight_clamp=args.pref_weight_clamp,
         d_model=args.d_model,
         n_attn_heads=args.n_attn_heads,
         n_attn_layers=args.n_attn_layers,

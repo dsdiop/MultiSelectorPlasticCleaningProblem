@@ -277,6 +277,13 @@ class CTDERAMTrainer:
         scalarization_power: float = 3.0,
         ewc_p: float = 1.0,
         ram_reward_mode: str = "component_rewards",
+        chebyshev_ref_clean: float = 1.0,
+        chebyshev_ref_cov: float = 1.0,
+        ref_autocalibrate: bool = False,
+        chebyshev_rho: float = 0.05,
+        stch_mu: float = 0.1,
+        wpop_eps: float = 0.01,
+        pref_weight_clamp: float = 0.05,
         # Main hard-role methods. The older modes below remain legacy-compatible.
         d_model: int = 64,
         n_attn_heads: int = 4,
@@ -364,8 +371,30 @@ class CTDERAMTrainer:
         self.ewc_p = float(ewc_p)
         self.scalarization_eps = 1e-8
         self.ram_reward_mode = ram_reward_mode.lower()
-        if self.ram_reward_mode not in {"component_rewards", "delta_metrics"}:
-            raise ValueError("ram_reward_mode must be one of: component_rewards, delta_metrics")
+        terminal_modes = {
+            "chebyshev_terminal", "chebyshev_augmented_terminal",
+            "wpop_terminal", "stch_terminal",
+        }
+        if self.ram_reward_mode not in {"component_rewards", "delta_metrics", *terminal_modes}:
+            raise ValueError(
+                "ram_reward_mode must be one of: component_rewards, delta_metrics, "
+                "chebyshev_terminal, chebyshev_augmented_terminal, wpop_terminal, stch_terminal"
+            )
+        self.chebyshev_ref_clean = float(chebyshev_ref_clean)
+        self.chebyshev_ref_cov = float(chebyshev_ref_cov)
+        self.ref_autocalibrate = bool(ref_autocalibrate)
+        self.chebyshev_rho = float(chebyshev_rho)
+        self.stch_mu = float(stch_mu)
+        self.wpop_eps = float(wpop_eps)
+        self.pref_weight_clamp = float(pref_weight_clamp)
+        if self.chebyshev_ref_clean < 0.0 or self.chebyshev_ref_cov < 0.0:
+            raise ValueError("Chebyshev reference values must be non-negative")
+        if self.chebyshev_rho < 0.0:
+            raise ValueError("chebyshev_rho must be non-negative")
+        if self.stch_mu <= 0.0 or self.wpop_eps <= 0.0:
+            raise ValueError("stch_mu and wpop_eps must be positive")
+        if not 0.0 <= self.pref_weight_clamp < 0.5:
+            raise ValueError("pref_weight_clamp must be in [0, 0.5)")
         self.rng = np.random.default_rng(seed)
         self.seed = int(seed)
         torch.manual_seed(seed)
@@ -403,6 +432,12 @@ class CTDERAMTrainer:
         self.ppo_critic_mode = ppo_critic_mode.lower()
         self.ppo_critic_popart = bool(ppo_critic_popart)
         self.ppo_advantage_scalarization = ppo_advantage_scalarization.lower()
+        if (
+            ram_mode == "ppo_ram"
+            and self.ram_reward_mode in terminal_modes
+            and self.ppo_critic_mode != "scalar"
+        ):
+            raise ValueError("terminal utility reward modes require --ppo-critic-mode scalar")
         if (
             ram_mode == "ppo_ram"
             and self.ppo_critic_mode == "vector"
@@ -555,6 +590,14 @@ class CTDERAMTrainer:
                 ewc_p=self.ewc_p,
                 d3po_diversity_coef=self.d3po_diversity_coef,
                 d3po_diversity_alpha=self.d3po_diversity_alpha,
+                ram_reward_mode=self.ram_reward_mode,
+                ref_clean=self.chebyshev_ref_clean,
+                ref_cov=self.chebyshev_ref_cov,
+                ref_autocalibrate=self.ref_autocalibrate,
+                chebyshev_rho=self.chebyshev_rho,
+                stch_mu=self.stch_mu,
+                wpop_eps=self.wpop_eps,
+                pref_weight_clamp=self.pref_weight_clamp,
             )
         elif self.ram_mode == "hard_role_q":
             self.hard_role_q = HardRoleQNetwork(**trunk_args).to(self.device)
@@ -594,6 +637,12 @@ class CTDERAMTrainer:
             print(
                 "[config] RAM reward normalization disabled for delta_metrics; "
                 "using raw metric-delta scalarization."
+            )
+        elif self.ram_reward_mode in terminal_modes:
+            print(
+                f"[config] {self.ram_reward_mode} utilities are materialized at rollout end "
+                f"(ref_clean={self.chebyshev_ref_clean:g}, ref_cov={self.chebyshev_ref_cov:g}, "
+                f"autocalibrate={self.ref_autocalibrate})."
             )
 
         self.step_count_low = 0
@@ -798,6 +847,23 @@ class CTDERAMTrainer:
         comps[0] = max(cleaned_now - cleaned_prev, 0.0)
         comps[1] = max(coverage_now - coverage_prev, 0.0)
         return comps
+
+    def _chebyshev_terminal_utility(
+        self, clean_final: float, cov_final: float, preference
+    ) -> float:
+        """Augmented-Chebyshev utility of one realized mission outcome."""
+        weights = np.asarray(preference, dtype=np.float64).reshape(-1)
+        if weights.shape != (2,):
+            raise ValueError(f"Chebyshev preference must have shape (2,), got {weights.shape}")
+        weights = weights / max(float(weights.sum()), 1e-8)
+        d_clean = max(0.0, self.chebyshev_ref_clean - float(clean_final))
+        d_cov = max(0.0, self.chebyshev_ref_cov - float(cov_final))
+        weighted_clean = float(weights[0]) * d_clean
+        weighted_cov = float(weights[1]) * d_cov
+        return -(
+            max(weighted_clean, weighted_cov)
+            + self.chebyshev_rho * (weighted_clean + weighted_cov)
+        )
 
     def _compute_step_reward_components(self, env, prev_metrics, r_vecs=None, info=None, curr_metrics=None):
         if self.ram_reward_mode == "delta_metrics":
@@ -1493,6 +1559,15 @@ class CTDERAMTrainer:
                 norm_reward_sum += macro_reward_vector
                 scalar_reward_sum += macro_reward
                 reward_steps += 1
+            elif self.ram_reward_mode in {
+                "chebyshev_terminal", "chebyshev_augmented_terminal",
+                "wpop_terminal", "stch_terminal",
+            }:
+                # Utilities are deliberately deferred until rollout end, when
+                # one fixed (possibly autocalibrated) reference is available.
+                macro_reward = 0.0
+                scalar_reward_sum += macro_reward
+                reward_steps += 1
 
             next_obs = np.asarray(obs_all, dtype=np.float32)
             next_budget = self._agent_budget_fracs(env)
@@ -1505,6 +1580,14 @@ class CTDERAMTrainer:
                     done=float(done), duration=float(duration), budget=start_budget,
                     next_maps=next_obs, next_previous_roles=roles_np,
                     next_budget=next_budget,
+                    terminal_clean=(
+                        self._env_value(env, "trash_cleaned_pct", float(info.get("trash_cleaned", 0.0)))
+                        if done else np.nan
+                    ),
+                    terminal_cov=(
+                        self._env_value(env, "coverage_pct", float(info.get("coverage", 0.0)))
+                        if done else np.nan
+                    ),
                 )
             elif training:
                 self.hard_role_replay.store(
@@ -2486,6 +2569,13 @@ class CTDERAMTrainer:
                 "ppo_advantage_scalarization": self.ppo_advantage_scalarization,
                 "d3po_diversity_coef": self.d3po_diversity_coef,
                 "d3po_diversity_alpha": self.d3po_diversity_alpha,
+                "chebyshev_ref_clean": self.chebyshev_ref_clean,
+                "chebyshev_ref_cov": self.chebyshev_ref_cov,
+                "ref_autocalibrate": self.ref_autocalibrate,
+                "chebyshev_rho": self.chebyshev_rho,
+                "stch_mu": self.stch_mu,
+                "wpop_eps": self.wpop_eps,
+                "pref_weight_clamp": self.pref_weight_clamp,
                 "hard_role_preference_conditioning": self.hard_role_preference_conditioning,
                 "hard_role_deep_input_projections": self.hard_role_deep_input_projections,
                 "ram_reward_mode": self.ram_reward_mode,
@@ -2527,6 +2617,12 @@ class CTDERAMTrainer:
                     None if self.ppo_learner is None else self.ppo_learner.popart_state_dict()
                 ),
                 "role_reward": self._role_reward_norm_state(),
+                "terminal_utility_reference": (
+                    None if self.ppo_learner is None else {
+                        "clean": self.ppo_learner.running_ref_clean,
+                        "cov": self.ppo_learner.running_ref_cov,
+                    }
+                ),
                 "switch_penalty_reward_scale": {
                     "abs_mean": float(self.role_reward_abs_mean),
                     "count": int(self.role_reward_abs_count),
@@ -2574,6 +2670,14 @@ class CTDERAMTrainer:
             self.ppo_learner.load_popart_state_dict(
                 ckpt.get("normalizers", {}).get("ppo_critic_popart")
             )
+            utility_ref = ckpt.get("normalizers", {}).get("terminal_utility_reference")
+            if utility_ref:
+                self.ppo_learner.running_ref_clean = max(
+                    self.ppo_learner.running_ref_clean, float(utility_ref["clean"])
+                )
+                self.ppo_learner.running_ref_cov = max(
+                    self.ppo_learner.running_ref_cov, float(utility_ref["cov"])
+                )
         self._load_role_reward_norm_state(ckpt.get("normalizers", {}).get("role_reward"))
         switch_scale = ckpt.get("normalizers", {}).get("switch_penalty_reward_scale", {})
         self.role_reward_abs_mean = float(switch_scale.get("abs_mean", self.role_reward_abs_mean))
