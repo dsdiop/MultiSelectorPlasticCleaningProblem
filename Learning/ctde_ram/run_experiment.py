@@ -258,11 +258,12 @@ def parse_args(argv=None):
         choices=[
             "component_rewards", "delta_metrics", "chebyshev_terminal",
             "chebyshev_augmented_terminal", "wpop_terminal", "stch_terminal",
+            "logw_terminal",
         ],
         default="component_rewards",
         help=(
             "RAM reward source: per-step component rewards, mission-metric deltas "
-            "per role window, or one terminal augmented-Chebyshev utility."
+            "per role window, or one terminal utility (Chebyshev, WPOP, STCH, or logw)."
         ),
     )
     p.add_argument("--chebyshev-ref-clean", type=float, default=1.0)

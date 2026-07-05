@@ -29,6 +29,10 @@ def parse_args():
     p.add_argument("--episodes-per-w", type=int, default=5)
     p.add_argument("--points", type=int, default=11, help="Number of weights from (1,0) to (0,1).")
     p.add_argument(
+        "--sample-actions", action="store_true",
+        help="Sample PPO role actions from the policy instead of deterministic argmax.",
+    )
+    p.add_argument(
         "--weights",
         type=str,
         default=None,
@@ -122,6 +126,8 @@ def main():
         tb_runname="tensorboard",
     )
     trainer.load_checkpoint(ckpt_path, load_optimizers=False, map_location=device)
+    if eval_args.sample_actions and train_args.ram_mode != "ppo_ram":
+        raise ValueError("--sample-actions currently applies only to --ram-mode ppo_ram")
     trainer.tb.log_text("eval/checkpoint", ckpt_path, step=0)
 
     progress_path = os.path.join(out_dir, "eval_progress.json")
@@ -155,6 +161,7 @@ def main():
         scal_grid=scal_grid,
         n_episodes_per_w=eval_args.episodes_per_w,
         progress_callback=save_eval_progress,
+        sample_roles=eval_args.sample_actions,
     )
     paths = save_pareto_artifacts(result, out_dir, "pareto_eval")
     write_json(progress_path, {

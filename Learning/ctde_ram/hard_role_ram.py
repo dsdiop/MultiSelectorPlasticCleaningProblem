@@ -417,7 +417,7 @@ class PPORAMLearner:
         data = rollout.as_tensors(self.device)
         terminal_modes = {
             "chebyshev_terminal", "chebyshev_augmented_terminal",
-            "wpop_terminal", "stch_terminal",
+            "wpop_terminal", "stch_terminal", "logw_terminal",
         }
         if self.ram_reward_mode in terminal_modes:
             terminal = data["done"] > 0.5
@@ -426,14 +426,18 @@ class PPORAMLearner:
                 cov = data["terminal_cov"][terminal]
                 if not torch.isfinite(clean).all() or not torch.isfinite(cov).all():
                     raise FloatingPointError("Missing terminal mission metrics for utility rollout")
-                if self.ref_autocalibrate and self.ram_reward_mode != "wpop_terminal":
+                ref_free_modes = {"wpop_terminal", "logw_terminal"}
+                if self.ref_autocalibrate and self.ram_reward_mode not in ref_free_modes:
                     self.running_ref_clean = max(self.running_ref_clean, float(clean.max().item()))
                     self.running_ref_cov = max(self.running_ref_cov, float(cov.max().item()))
                 ref_clean, ref_cov = self.running_ref_clean, self.running_ref_cov
                 self.last_utility_ref = (ref_clean, ref_cov)
                 w = data["preference"][terminal]
                 w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-                if self.ram_reward_mode == "wpop_terminal":
+                if self.ram_reward_mode == "logw_terminal":
+                    vals = torch.stack((clean, cov), dim=-1).clamp_min(self.wpop_eps)
+                    utility = (w * torch.log(vals)).sum(dim=-1)
+                elif self.ram_reward_mode == "wpop_terminal":
                     w = w.clamp(self.pref_weight_clamp, 1.0 - self.pref_weight_clamp)
                     vals = torch.stack((clean, cov), dim=-1).clamp_min(self.wpop_eps)
                     utility = torch.prod(vals.pow(w), dim=-1)

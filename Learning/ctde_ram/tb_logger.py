@@ -45,6 +45,13 @@ class TBLogger:
         if self.enabled:
             self.writer.add_scalar(tag, float(value), self.global_step)
 
+    def log_step_group(self, values):
+        """Log one optimizer update and advance its shared step exactly once."""
+        if self.enabled:
+            for tag, value in values.items():
+                self.writer.add_scalar(tag, float(value), self.global_step)
+        self.global_step += 1
+
     def log_scalar(self, tag, value, step=None):
         if self.enabled:
             self.writer.add_scalar(tag, float(value), self.global_step if step is None else int(step))

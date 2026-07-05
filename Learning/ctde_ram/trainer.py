@@ -373,12 +373,13 @@ class CTDERAMTrainer:
         self.ram_reward_mode = ram_reward_mode.lower()
         terminal_modes = {
             "chebyshev_terminal", "chebyshev_augmented_terminal",
-            "wpop_terminal", "stch_terminal",
+            "wpop_terminal", "stch_terminal", "logw_terminal",
         }
         if self.ram_reward_mode not in {"component_rewards", "delta_metrics", *terminal_modes}:
             raise ValueError(
                 "ram_reward_mode must be one of: component_rewards, delta_metrics, "
-                "chebyshev_terminal, chebyshev_augmented_terminal, wpop_terminal, stch_terminal"
+                "chebyshev_terminal, chebyshev_augmented_terminal, wpop_terminal, "
+                "stch_terminal, logw_terminal"
             )
         self.chebyshev_ref_clean = float(chebyshev_ref_clean)
         self.chebyshev_ref_cov = float(chebyshev_ref_cov)
@@ -639,10 +640,17 @@ class CTDERAMTrainer:
                 "using raw metric-delta scalarization."
             )
         elif self.ram_reward_mode in terminal_modes:
+            if self.ram_reward_mode == "logw_terminal":
+                details = f"objective_eps={self.wpop_eps:g}, reference-free"
+            else:
+                details = (
+                    f"ref_clean={self.chebyshev_ref_clean:g}, "
+                    f"ref_cov={self.chebyshev_ref_cov:g}, "
+                    f"autocalibrate={self.ref_autocalibrate}"
+                )
             print(
                 f"[config] {self.ram_reward_mode} utilities are materialized at rollout end "
-                f"(ref_clean={self.chebyshev_ref_clean:g}, ref_cov={self.chebyshev_ref_cov:g}, "
-                f"autocalibrate={self.ref_autocalibrate})."
+                f"({details})."
             )
 
         self.step_count_low = 0
@@ -1391,8 +1399,10 @@ class CTDERAMTrainer:
             self._sync_ram_target()
 
         lv = float(loss.item())
-        self.tb.log_step("train/ram_loss", lv)
-        self.tb.log_step("train/global_agg_grad_abs_sum", self.last_global_agg_grad_abs_sum)
+        self.tb.log_step_group({
+            "train/ram_loss": lv,
+            "train/global_agg_grad_abs_sum": self.last_global_agg_grad_abs_sum,
+        })
         return lv
 
     # ---------- main hard-role methods ----------
@@ -1450,7 +1460,10 @@ class CTDERAMTrainer:
         fraction = min(self.per_beta_progress / 100_000.0, 1.0)
         return self.per_beta_start + fraction * (self.per_beta_end - self.per_beta_start)
 
-    def _run_hard_role_episode(self, env, scal_weights, epsilon_low, epsilon_ram, training=True, attention_records=None, seed=None):
+    def _run_hard_role_episode(
+        self, env, scal_weights, epsilon_low, epsilon_ram, training=True,
+        attention_records=None, seed=None, sample_roles=False,
+    ):
         self._active_env = env
         if not self._env_uses_expert_nu(env):
             raise ValueError(
@@ -1459,7 +1472,11 @@ class CTDERAMTrainer:
             )
         scal_weights = np.asarray(scal_weights, dtype=np.float32)
         scal_weights /= max(float(scal_weights.sum()), 1e-8)
-        obs_all, done, ep_step = env.reset(seed=seed), False, 0
+        obs_all = (
+            self._reset_evaluation_episode(env, seed)
+            if not training and seed is not None else env.reset(seed=seed)
+        )
+        done, ep_step = False, 0
         previous_roles = np.zeros(self.N, dtype=np.int64)
         total_reward, switches = 0.0, 0
         role_counts = np.zeros(2, dtype=np.float64)
@@ -1482,7 +1499,10 @@ class CTDERAMTrainer:
             }
             roles, policy_info = self._select_main_hard_roles(
                 obs_all, previous_roles, scal_weights, epsilon_ram,
-                training=training, return_attn=attention_records is not None,
+                # Sampling changes action selection only. `training` remains
+                # false during stochastic evaluation, so no rollout is stored.
+                training=training or sample_roles,
+                return_attn=attention_records is not None,
             )
             roles_np = _tensor_to_numpy(roles, dtype=np.int64)
             if decisions and not np.array_equal(roles_np, previous_roles):
@@ -1561,10 +1581,10 @@ class CTDERAMTrainer:
                 reward_steps += 1
             elif self.ram_reward_mode in {
                 "chebyshev_terminal", "chebyshev_augmented_terminal",
-                "wpop_terminal", "stch_terminal",
+                "wpop_terminal", "stch_terminal", "logw_terminal",
             }:
-                # Utilities are deliberately deferred until rollout end, when
-                # one fixed (possibly autocalibrated) reference is available.
+                # Utilities are deliberately deferred until rollout end, once
+                # the realized mission objectives (and any reference) are fixed.
                 macro_reward = 0.0
                 scalar_reward_sum += macro_reward
                 reward_steps += 1
@@ -1609,13 +1629,16 @@ class CTDERAMTrainer:
             update = self.ppo_learner.update(self.ppo_rollout)
             if update is not None:
                 losses.append(update.loss)
-                self.tb.log_step("train/ppo_policy_loss", update.policy_loss)
-                self.tb.log_step("train/ppo_value_loss", update.value_loss)
-                self.tb.log_step("train/ppo_entropy", update.entropy)
-                self.tb.log_step("train/ppo_approx_kl", update.approx_kl)
-                self.tb.log_step("train/ppo_epochs_ran", update.epochs_ran)
+                ppo_metrics = {
+                    "train/ppo_policy_loss": update.policy_loss,
+                    "train/ppo_value_loss": update.value_loss,
+                    "train/ppo_entropy": update.entropy,
+                    "train/ppo_approx_kl": update.approx_kl,
+                    "train/ppo_epochs_ran": update.epochs_ran,
+                }
                 if self.ppo_advantage_scalarization == "d3po":
-                    self.tb.log_step("train/ppo_d3po_diversity_loss", update.diversity_loss)
+                    ppo_metrics["train/ppo_d3po_diversity_loss"] = update.diversity_loss
+                self.tb.log_step_group(ppo_metrics)
 
         denom = max(float(role_counts.sum()), 1.0)
         metrics = {
@@ -1646,12 +1669,16 @@ class CTDERAMTrainer:
             return None
         update = self.ppo_learner.update(self.ppo_rollout)
         if update is not None:
-            self.tb.log_step("train/ppo_policy_loss", update.policy_loss)
-            self.tb.log_step("train/ppo_value_loss", update.value_loss)
-            self.tb.log_step("train/ppo_entropy", update.entropy)
-            self.tb.log_step("train/ppo_approx_kl", update.approx_kl)
+            ppo_metrics = {
+                "train/ppo_policy_loss": update.policy_loss,
+                "train/ppo_value_loss": update.value_loss,
+                "train/ppo_entropy": update.entropy,
+                "train/ppo_approx_kl": update.approx_kl,
+                "train/ppo_epochs_ran": update.epochs_ran,
+            }
             if self.ppo_advantage_scalarization == "d3po":
-                self.tb.log_step("train/ppo_d3po_diversity_loss", update.diversity_loss)
+                ppo_metrics["train/ppo_d3po_diversity_loss"] = update.diversity_loss
+            self.tb.log_step_group(ppo_metrics)
         return update
 
     # ---------- one training episode ----------
@@ -1968,6 +1995,7 @@ class CTDERAMTrainer:
         show_progress: bool = False,
         progress_desc: Optional[str] = None,
         episode_seeds=None,
+        sample_roles: bool = False,
     ):
         if self.main_hard_role_mode:
             if episode_seeds is None:
@@ -1976,7 +2004,7 @@ class CTDERAMTrainer:
             for episode_i in range(n_episodes):
                 row = self._run_hard_role_episode(
                     env, scal_weights, 0.0, 0.0, training=False,
-                    seed=int(episode_seeds[episode_i]),
+                    seed=int(episode_seeds[episode_i]), sample_roles=sample_roles,
                 )
                 role_counts += np.asarray([
                     round(row["role0_frac"] * row["role_decisions"] * self.N),
@@ -2390,6 +2418,7 @@ class CTDERAMTrainer:
         ref_point=(0.0, 0.0),
         progress_callback=None,
         episode_seed_base: Optional[int] = None,
+        sample_roles: bool = False,
     ):
         scal_grid = list(scal_grid)
         seed_base = self.seed if episode_seed_base is None else int(episode_seed_base)
@@ -2414,6 +2443,7 @@ class CTDERAMTrainer:
                 show_progress=tqdm is not None,
                 progress_desc=f"eval episodes w=({weight_label})",
                 episode_seeds=episode_seeds,
+                sample_roles=sample_roles,
             )
             self.tb.log_role_histogram(mm.pop("_role_counts", np.zeros(self.K, dtype=np.int64)))
             if eval_bar is not None:
