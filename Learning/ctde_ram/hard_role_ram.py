@@ -23,22 +23,86 @@ except ImportError:
     from popart import PopArtNorm
 
 
-class AllocentricMapCNN(nn.Module):
-    """One shared CNN over the complete three-channel map stack."""
+def _coord_channels(maps: torch.Tensor) -> torch.Tensor:
+    """Two constant channels with normalized x/y coordinates in [-1,1].
 
-    def __init__(self, d_model: int = 64):
+    Global average pooling alone collapses a map to "how much" per channel and
+    loses "where" -- the CNN can't represent a fact like "trash is 3 cells to my
+    east". These let the conv stack compute mass-weighted centroids before
+    pooling, recovering relative geometry almost for free.
+    """
+    b, _, h, w = maps.shape
+    ys = torch.linspace(-1.0, 1.0, h, device=maps.device, dtype=maps.dtype)
+    xs = torch.linspace(-1.0, 1.0, w, device=maps.device, dtype=maps.dtype)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    coords = torch.stack((grid_x, grid_y), dim=0)
+    return coords.unsqueeze(0).expand(b, -1, -1, -1)
+
+
+class _PooledCoordCNN(nn.Module):
+    """Conv stack with CoordConv input and concat(avgpool, maxpool) output.
+
+    Concatenating max-pool alongside avg-pool keeps a "closest/strongest
+    signal" feature next to the mean one, instead of only the mean.
+    """
+
+    def __init__(self, in_channels: int, channel_widths: tuple, d_model: int):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(64, d_model),
-        )
+        layers = []
+        prev = in_channels + 2
+        for width in channel_widths:
+            layers += [nn.Conv2d(prev, width, 3, padding=1), nn.ReLU()]
+            prev = width
+        self.net = nn.Sequential(*layers)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Linear(2 * prev, d_model)
 
     def forward(self, maps: torch.Tensor) -> torch.Tensor:
-        return self.net(maps)
+        features = self.net(torch.cat((maps, _coord_channels(maps)), dim=1))
+        # nn.AdaptiveMaxPool2d's CUDA backward has no deterministic
+        # implementation and crashes under torch.use_deterministic_algorithms
+        # (which this codebase always enables). torch.amax is numerically the
+        # same global max but has a deterministic backward.
+        pooled = torch.cat(
+            (self.avgpool(features).flatten(1), features.amax(dim=(-2, -1))), dim=1
+        )
+        return self.head(pooled)
+
+
+class JointMapCNN(_PooledCoordCNN):
+    """Single CNN over the full 3-channel stack, once per agent.
+
+    CoordConv + avg/max pooling (fix #2) without the world/agent split (fix
+    #5), so the two can be A/B tested independently.
+    """
+
+    def __init__(self, d_model: int = 64):
+        super().__init__(in_channels=3, channel_widths=(32, 64, 64), d_model=d_model)
+
+
+class WorldEncoderCNN(_PooledCoordCNN):
+    """Encodes the fleet-shared belief channel (known trash/coverage info).
+
+    This channel is byte-identical across all N agents within a batch element
+    -- see ProjectPatrollingCTDEEnv/update_state: `normalized_known_information`
+    is computed once per env step and copied into every agent's observation.
+    Running the full-size world CNN once per batch element instead of once per
+    agent removes that redundant compute.
+    """
+
+    def __init__(self, d_model: int = 64):
+        super().__init__(in_channels=1, channel_widths=(32, 64, 64), d_model=d_model)
+
+
+class AgentEncoderCNN(_PooledCoordCNN):
+    """Lightweight per-agent encoder: own position+trail, other agents/fleet.
+
+    Deliberately smaller than the world encoder -- these 2 channels carry less
+    to disentangle than the belief map, and this one still runs once per agent.
+    """
+
+    def __init__(self, d_model: int = 64):
+        super().__init__(in_channels=2, channel_widths=(16, 32), d_model=d_model)
 
 
 class PreferenceFiLM(nn.Module):
@@ -86,6 +150,7 @@ class HardRoleAttentionTrunk(nn.Module):
         preference_role_bias: bool = False,
         preference_conditioning: str = "film",
         deep_input_projections: bool = False,
+        world_agent_split: bool = False,
     ):
         super().__init__()
         self.d_model = int(d_model)
@@ -95,14 +160,28 @@ class HardRoleAttentionTrunk(nn.Module):
             raise ValueError("preference_conditioning must be one of: film, pref_token")
         if self.preference_conditioning == "pref_token" and int(n_layers) < 2:
             raise ValueError("pref_token preference conditioning requires n_layers >= 2")
-        self.map_cnn = AllocentricMapCNN(d_model)
+        # world_agent_split isolates fix #5 (shared world encoder + light
+        # per-agent encoder) from fix #2 (CoordConv + avg/max pooling), which
+        # both encoders below always use regardless of this flag.
+        self.world_agent_split = bool(world_agent_split)
+        if self.world_agent_split:
+            self.world_cnn = WorldEncoderCNN(d_model)
+            self.agent_cnn = AgentEncoderCNN(d_model)
+            self.map_cnn = None
+        else:
+            self.map_cnn = JointMapCNN(d_model)
+            self.world_cnn = self.agent_cnn = None
         self.previous_role_embedding = nn.Embedding(2, d_model)
+        # 2 input features: [remaining_budget_frac, episode_progress]. The two
+        # diverge whenever a step doesn't consume exactly one distance unit,
+        # so episode progress is not redundant with budget -- see
+        # ProjectPatrollingCTDEEnv.episode_progress().
         self.budget_projection = (
             nn.Sequential(
-                nn.Linear(1, d_model), nn.ReLU(),
+                nn.Linear(2, d_model), nn.ReLU(),
                 nn.Linear(d_model, d_model),
             )
-            if self.deep_input_projections else nn.Linear(1, d_model)
+            if self.deep_input_projections else nn.Linear(2, d_model)
         )
         self.preference_film = (
             PreferenceFiLM(2, d_model)
@@ -132,25 +211,29 @@ class HardRoleAttentionTrunk(nn.Module):
         if maps.ndim != 5 or maps.shape[2] != 3:
             raise ValueError(f"Hard-role RAM expects [B,N,3,H,W] maps, got {tuple(maps.shape)}")
         batch, n_agents = maps.shape[:2]
-        z = self.map_cnn(maps.reshape(batch * n_agents, *maps.shape[2:]))
-        z = z.reshape(batch, n_agents, self.d_model)
+        if self.world_agent_split:
+            # Channel 0 (belief map) is identical across agents by
+            # construction, so the world encoder runs once per batch element,
+            # not once per agent.
+            world_z = self.world_cnn(maps[:, 0, 0:1])
+            world_z = world_z.unsqueeze(1).expand(-1, n_agents, -1)
+            agent_z = self.agent_cnn(
+                maps[:, :, 1:3].reshape(batch * n_agents, 2, *maps.shape[3:])
+            ).reshape(batch, n_agents, self.d_model)
+            z = world_z + agent_z
+        else:
+            z = self.map_cnn(maps.reshape(batch * n_agents, *maps.shape[2:]))
+            z = z.reshape(batch, n_agents, self.d_model)
         role_z = self.previous_role_embedding(previous_roles.long())
-        # Preferred path: one remaining-budget fraction per agent [B,N,1].
-        # Keep [B] / [B,1] support for old checkpoints and synthetic callers by
-        # broadcasting the fleet scalar to every homogeneous agent.
-        if budget.ndim == 1:
-            budget = budget.unsqueeze(-1)
+        # budget carries 2 features per slot: [budget_frac, episode_progress].
+        # Preferred path: one pair per agent [B,N,2]. A [B,2] fleet-shared pair
+        # is also accepted and broadcast to every homogeneous agent.
         if budget.ndim == 2:
-            if budget.shape[1] == 1:
-                budget_z = self.budget_projection(budget).unsqueeze(1).expand(-1, n_agents, -1)
-            elif budget.shape[1] == n_agents:
-                budget_z = self.budget_projection(budget.unsqueeze(-1))
-            else:
-                raise ValueError(f"Budget must be [B,1], [B,N], or [B,N,1], got {tuple(budget.shape)}")
-        elif budget.ndim == 3 and budget.shape[1:] == (n_agents, 1):
+            budget_z = self.budget_projection(budget).unsqueeze(1).expand(-1, n_agents, -1)
+        elif budget.ndim == 3 and budget.shape[1] == n_agents:
             budget_z = self.budget_projection(budget)
         else:
-            raise ValueError(f"Budget must be [B,1], [B,N], or [B,N,1], got {tuple(budget.shape)}")
+            raise ValueError(f"Budget must be [B,F] or [B,N,F], got {tuple(budget.shape)}")
         token = z + role_z + budget_z
         if self.preference_conditioning == "film":
             gamma, beta = self.preference_film(preference)
@@ -300,6 +383,8 @@ class PPORAMLearner:
         ref_autocalibrate: bool = False, chebyshev_rho: float = 0.05,
         stch_mu: float = 0.1, wpop_eps: float = 0.01,
         pref_weight_clamp: float = 0.05,
+        dense_reward_mode: str = "none", dense_scalarization: str = "sum",
+        dense_terminal_ratio: float = 0.2,
     ):
         self.actor, self.critic = actor, critic
         self.actor_optim = torch.optim.Adam(actor.parameters(), lr=actor_lr)
@@ -332,6 +417,14 @@ class PPORAMLearner:
         self.stch_mu = float(stch_mu)
         self.wpop_eps = float(wpop_eps)
         self.pref_weight_clamp = float(pref_weight_clamp)
+        self.dense_reward_mode = str(dense_reward_mode).lower()
+        self.dense_scalarization = str(dense_scalarization).lower()
+        self.dense_terminal_ratio = float(dense_terminal_ratio)
+        self.dense_return_min = None
+        self.dense_return_max = None
+        self.dense_terminal_scale = None
+        self.dense_beta = None
+        self._dense_sanity_printed = False
         self.last_utility_ref = (self.running_ref_clean, self.running_ref_cov)
         self.last_terminal_utilities = []
         self.scalarization_power, self.ewc_p = float(scalarization_power), float(ewc_p)
@@ -342,6 +435,93 @@ class PPORAMLearner:
             [PopArtNorm(head, alpha=popart_alpha, rescale=True) for head in critic.popart_heads()]
             if self.critic_popart else []
         )
+
+    def set_dense_reward_stats(self, return_min, return_max, terminal_scale):
+        """Install episode-level warmup statistics used before PPO minibatching."""
+        if return_min is not None and return_max is not None:
+            lo = torch.as_tensor(return_min, dtype=torch.float32, device=self.device)
+            hi = torch.as_tensor(return_max, dtype=torch.float32, device=self.device)
+            if lo.shape != (2,) or hi.shape != (2,) or not torch.isfinite(lo).all() or not torch.isfinite(hi).all():
+                raise ValueError("dense return min/max must be finite vectors with shape (2,)")
+            if not torch.all(hi > lo):
+                raise ValueError("dense warmup requires max > min for both objective returns")
+            self.dense_return_min, self.dense_return_max = lo, hi
+        scale = float(terminal_scale)
+        if not np.isfinite(scale) or scale <= 0.0:
+            raise ValueError("dense terminal_scale must be finite and positive")
+        self.dense_terminal_scale = scale
+        # Both contribution and metric-delta episode sums are bounded by two
+        # under the default preference-free sum. Keep rho <= 0.3 in practice:
+        # larger values can flatten preferences and lose a concave Pareto corner.
+        self.dense_beta = self.dense_terminal_ratio * scale / 2.0
+
+    @staticmethod
+    def normalize_dense_return(value, minimum, maximum):
+        return ((value - minimum) / (maximum - minimum).clamp_min(1e-8)).clamp(0.0, 1.0)
+
+    def _scalarize_dense(self, values: torch.Tensor, preference: torch.Tensor) -> torch.Tensor:
+        if self.dense_scalarization == "sum":
+            return values.sum(dim=-1)
+        weights = preference / preference.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        if self.dense_scalarization == "ws":
+            return (weights * values).sum(dim=-1)
+        if self.dense_scalarization == "wp":
+            nearest = round(self.scalarization_power)
+            powered = (
+                values.pow(int(nearest))
+                if abs(self.scalarization_power - nearest) < 1e-8
+                else values.clamp_min(self.scalarization_eps).pow(self.scalarization_power)
+            )
+            return (weights * powered).sum(dim=-1)
+        if self.dense_scalarization == "wpop":
+            return torch.prod(values.clamp_min(self.scalarization_eps).pow(weights), dim=-1)
+        if self.dense_scalarization == "ewc":
+            gains = torch.exp(self.ewc_p * weights) - 1.0
+            return (gains * torch.exp(self.ewc_p * values.clamp(-20.0, 20.0))).sum(dim=-1)
+        raise ValueError(f"Unknown dense scalarization: {self.dense_scalarization}")
+
+    def _materialize_dense_rewards(self, data) -> tuple[torch.Tensor, list[tuple[slice, torch.Tensor]]]:
+        components = data["dense_components"]
+        dense = torch.zeros(len(components), dtype=torch.float32, device=self.device)
+        episode_details = []
+        start = 0
+        boundaries = torch.nonzero(data["done"] > 0.5, as_tuple=False).flatten().tolist()
+        if not boundaries or boundaries[-1] != len(components) - 1:
+            boundaries.append(len(components) - 1)
+        for end in boundaries:
+            segment = slice(start, end + 1)
+            per_step = components[segment]
+            totals = per_step.sum(dim=0)
+            if self.dense_reward_mode == "delta":
+                dense_vectors = per_step.clamp(0.0, 1.0)
+            elif self.dense_reward_mode == "contribution":
+                if self.dense_return_min is None or self.dense_return_max is None:
+                    raise RuntimeError("contribution dense reward requires completed warmup min/max")
+                normalized = self.normalize_dense_return(
+                    totals, self.dense_return_min, self.dense_return_max
+                )
+                ratios = torch.where(
+                    totals.abs() > self.scalarization_eps,
+                    per_step / totals.unsqueeze(0),
+                    torch.zeros_like(per_step),
+                )
+                dense_vectors = ratios * normalized.unsqueeze(0)
+            elif self.dense_reward_mode == "final_sum_normalized":
+                dense_vectors = torch.where(
+                    totals.abs().unsqueeze(0) > self.scalarization_eps,
+                    per_step / totals.unsqueeze(0),
+                    torch.zeros_like(per_step),
+                )
+            else:
+                raise ValueError(f"Unknown dense reward mode: {self.dense_reward_mode}")
+            dense[segment] = self._scalarize_dense(dense_vectors, data["preference"][segment])
+            episode_details.append((segment, totals.detach()))
+            start = end + 1
+        if self.dense_reward_mode != "final_sum_normalized":
+            if self.dense_beta is None:
+                raise RuntimeError("dense companion reward requires completed terminal-scale warmup")
+            dense = self.dense_beta * dense
+        return dense, episode_details
 
     def denormalize_values(self, values: torch.Tensor) -> torch.Tensor:
         if not self.popart:
@@ -361,18 +541,22 @@ class PPORAMLearner:
         return self.popart[0].normalize_target(returns)
 
     def _scalarize_advantages(self, advantages: torch.Tensor, preference: torch.Tensor) -> torch.Tensor:
-        # Per-objective standardization keeps a preference weight semantically
-        # comparable even when the objective returns have different scales.
-        mean = advantages.mean(dim=0, keepdim=True)
-        std = advantages.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
-        z = (advantages - mean) / std
         weights = preference / preference.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         if self.advantage_scalarization == "ws":
-            scalar = (weights * z).sum(dim=-1)
+            # advantages is already in raw (PopArt-denormalized) per-objective
+            # units -- see denormalize_values() feeding data["value"]/next_values --
+            # so this is the exact linear-scalarization advantage A_w = w . A_vec
+            # for J_w = E[w . G_vec], consistent with the vector critic's
+            # V_w = w . V_vec. Only the combined scalar is centered/scaled,
+            # matching standard PPO advantage normalization.
+            scalar = (weights * advantages).sum(dim=-1)
             return (scalar - scalar.mean()) / scalar.std(unbiased=False).clamp_min(1e-8)
         # Product/power scalarizers need non-negative inputs. A rollout-local,
         # per-objective min-max mapping retains ordering and avoids invalid
         # fractional powers of signed GAE values.
+        mean = advantages.mean(dim=0, keepdim=True)
+        std = advantages.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-8)
+        z = (advantages - mean) / std
         lo, hi = z.amin(dim=0, keepdim=True), z.amax(dim=0, keepdim=True)
         positive = (z - lo) / (hi - lo).clamp_min(1e-8)
         positive = positive.clamp_min(self.scalarization_eps)
@@ -411,6 +595,40 @@ class PPORAMLearner:
         w_prime = (preference + noise).clamp(min=0.0)
         return w_prime / w_prime.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
+    def terminal_utility(self, clean, cov, preference, update_reference=True):
+        """Compute terminal utility for tensors of realized mission outcomes."""
+        clean = torch.as_tensor(clean, dtype=torch.float32, device=self.device).reshape(-1)
+        cov = torch.as_tensor(cov, dtype=torch.float32, device=self.device).reshape(-1)
+        w = torch.as_tensor(preference, dtype=torch.float32, device=self.device).reshape(-1, 2)
+        if not torch.isfinite(clean).all() or not torch.isfinite(cov).all():
+            raise FloatingPointError("Missing terminal mission metrics for utility rollout")
+        ref_free_modes = {"wpop_terminal", "logw_terminal"}
+        if update_reference and self.ref_autocalibrate and self.ram_reward_mode not in ref_free_modes:
+            self.running_ref_clean = max(self.running_ref_clean, float(clean.max().item()))
+            self.running_ref_cov = max(self.running_ref_cov, float(cov.max().item()))
+        ref_clean, ref_cov = self.running_ref_clean, self.running_ref_cov
+        self.last_utility_ref = (ref_clean, ref_cov)
+        w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        if self.ram_reward_mode == "logw_terminal":
+            vals = torch.stack((clean, cov), dim=-1).clamp_min(self.wpop_eps)
+            return (w * torch.log(vals)).sum(dim=-1)
+        if self.ram_reward_mode == "wpop_terminal":
+            w = w.clamp(self.pref_weight_clamp, 1.0 - self.pref_weight_clamp)
+            vals = torch.stack((clean, cov), dim=-1).clamp_min(self.wpop_eps)
+            return torch.prod(vals.pow(w), dim=-1)
+        distances = torch.stack((
+            (ref_clean - clean).clamp_min(0.0),
+            (ref_cov - cov).clamp_min(0.0),
+        ), dim=-1)
+        terms = w * distances
+        if self.ram_reward_mode == "stch_terminal":
+            smooth_max = self.stch_mu * (
+                torch.logsumexp(terms / self.stch_mu, dim=-1)
+                - np.log(terms.shape[-1])
+            )
+            return -smooth_max
+        return -(terms.max(dim=-1).values + self.chebyshev_rho * terms.sum(dim=-1))
+
     def update(self, rollout):
         if len(rollout) == 0:
             return None
@@ -419,47 +637,37 @@ class PPORAMLearner:
             "chebyshev_terminal", "chebyshev_augmented_terminal",
             "wpop_terminal", "stch_terminal", "logw_terminal",
         }
+        dense_rewards = None
+        dense_episode_details = []
+        if self.dense_reward_mode != "none":
+            dense_rewards, dense_episode_details = self._materialize_dense_rewards(data)
+            # Dense standalone replaces the environment reward; companion modes
+            # seed every step before the preference-conditioned terminal utility
+            # is added below.
+            data["reward"] = dense_rewards.clone()
         if self.ram_reward_mode in terminal_modes:
             terminal = data["done"] > 0.5
             if terminal.any():
                 clean = data["terminal_clean"][terminal]
                 cov = data["terminal_cov"][terminal]
-                if not torch.isfinite(clean).all() or not torch.isfinite(cov).all():
-                    raise FloatingPointError("Missing terminal mission metrics for utility rollout")
-                ref_free_modes = {"wpop_terminal", "logw_terminal"}
-                if self.ref_autocalibrate and self.ram_reward_mode not in ref_free_modes:
-                    self.running_ref_clean = max(self.running_ref_clean, float(clean.max().item()))
-                    self.running_ref_cov = max(self.running_ref_cov, float(cov.max().item()))
-                ref_clean, ref_cov = self.running_ref_clean, self.running_ref_cov
-                self.last_utility_ref = (ref_clean, ref_cov)
                 w = data["preference"][terminal]
-                w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-                if self.ram_reward_mode == "logw_terminal":
-                    vals = torch.stack((clean, cov), dim=-1).clamp_min(self.wpop_eps)
-                    utility = (w * torch.log(vals)).sum(dim=-1)
-                elif self.ram_reward_mode == "wpop_terminal":
-                    w = w.clamp(self.pref_weight_clamp, 1.0 - self.pref_weight_clamp)
-                    vals = torch.stack((clean, cov), dim=-1).clamp_min(self.wpop_eps)
-                    utility = torch.prod(vals.pow(w), dim=-1)
-                else:
-                    distances = torch.stack((
-                        (ref_clean - clean).clamp_min(0.0),
-                        (ref_cov - cov).clamp_min(0.0),
-                    ), dim=-1)
-                    terms = w * distances
-                    if self.ram_reward_mode == "stch_terminal":
-                        # Normalized smooth max: subtract log(K), so a perfect
-                        # outcome has utility exactly zero while retaining gradients.
-                        smooth_max = self.stch_mu * (
-                            torch.logsumexp(terms / self.stch_mu, dim=-1)
-                            - np.log(terms.shape[-1])
-                        )
-                        utility = -smooth_max
-                    else:
-                        utility = -(terms.max(dim=-1).values + self.chebyshev_rho * terms.sum(dim=-1))
-                data["reward"].zero_()
-                data["reward"][terminal] = utility
+                utility = self.terminal_utility(clean, cov, w, update_reference=True)
+                if dense_rewards is None:
+                    data["reward"].zero_()
+                data["reward"][terminal] += utility
                 self.last_terminal_utilities = utility.detach().cpu().tolist()
+                if dense_rewards is not None and not self._dense_sanity_printed:
+                    first_segment, _ = dense_episode_details[0]
+                    dense_total = float(dense_rewards[first_segment].sum().item())
+                    terminal_abs = float(utility[0].abs().item())
+                    bound = self.dense_terminal_ratio * float(self.dense_terminal_scale)
+                    print(
+                        "[dense:sanity] "
+                        f"episode_dense_sum={dense_total:.6g} "
+                        f"terminal_abs={terminal_abs:.6g} "
+                        f"rho_terminal_scale_bound={bound:.6g} beta={self.dense_beta:.6g}"
+                    )
+                    self._dense_sanity_printed = True
         with torch.no_grad():
             next_values = self.denormalize_values(self.critic(data["next_maps"], data["next_previous_roles"], data["next_budget"], data["preference"]))
             discounts = self.gamma ** data["duration"]

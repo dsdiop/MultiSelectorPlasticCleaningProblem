@@ -274,6 +274,20 @@ def parse_args(argv=None):
     p.add_argument("--wpop-eps", type=float, default=0.01)
     p.add_argument("--pref-weight-clamp", type=float, default=0.05)
     p.add_argument(
+        "--dense-reward-mode",
+        choices=["none", "contribution", "delta", "final_sum_normalized"],
+        default="none",
+        help="Optional episode-aware dense PPO reward layered over terminal utility modes.",
+    )
+    p.add_argument(
+        "--dense-scalarization",
+        choices=["sum", "ws", "wp", "wpop", "ewc"],
+        default="sum",
+        help="How dense objective components are combined; sum is preference-independent.",
+    )
+    p.add_argument("--dense-terminal-ratio", type=float, default=0.2)
+    p.add_argument("--dense-warmup-episodes", type=int, default=100)
+    p.add_argument(
         "--q-scalarization",
         choices=["ws", "wp", "wpop", "ewc"],
         default="ws",
@@ -310,6 +324,17 @@ def parse_args(argv=None):
         help=(
             "Use MLP projections (input->d_model->d_model) for budget and the "
             "preference token. Disabled by default for old-checkpoint compatibility."
+        ),
+    )
+    p.add_argument(
+        "--world-agent-split",
+        action="store_true",
+        help=(
+            "Split the map CNN into a shared world encoder (belief channel, "
+            "run once per batch) and a lighter per-agent encoder (position + "
+            "fleet channels), instead of one joint CNN over all 3 channels "
+            "per agent. Both paths always use CoordConv + avg/max pooling; "
+            "this flag isolates the split itself for A/B testing."
         ),
     )
     # PPO-RAM.
@@ -595,6 +620,10 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         stch_mu=args.stch_mu,
         wpop_eps=args.wpop_eps,
         pref_weight_clamp=args.pref_weight_clamp,
+        dense_reward_mode=args.dense_reward_mode,
+        dense_scalarization=args.dense_scalarization,
+        dense_terminal_ratio=args.dense_terminal_ratio,
+        dense_warmup_episodes=args.dense_warmup_episodes,
         d_model=args.d_model,
         n_attn_heads=args.n_attn_heads,
         n_attn_layers=args.n_attn_layers,
@@ -602,6 +631,7 @@ def build_trainer(args, env, low_level_backend, t_role, device, tb_logdir=None, 
         preference_role_bias=args.preference_role_bias,
         hard_role_preference_conditioning=args.hard_role_preference_conditioning,
         hard_role_deep_input_projections=args.hard_role_deep_input_projections,
+        hard_role_world_agent_split=args.world_agent_split,
         ppo_epochs=args.ppo_epochs,
         ppo_minibatch_size=args.ppo_minibatch_size,
         ppo_rollout_macro_steps=args.ppo_rollout_macro_steps,
@@ -705,6 +735,19 @@ def main():
             f"{preference_report['mean_abs_score_difference']:.8f} "
             f"roles_differ={preference_report['roles_differ']}"
         )
+
+    if args.dense_reward_mode in {"contribution", "delta"}:
+        print(
+            f"[dense:warmup] mode={args.dense_reward_mode} "
+            f"episodes={args.dense_warmup_episodes}"
+        )
+        dense_stats = trainer.warmup_dense_reward(
+            env,
+            n_episodes=args.dense_warmup_episodes,
+            weight_sampling=args.weight_sampling,
+            weight_alpha=args.weight_alpha,
+        )
+        write_json(os.path.join(metrics_dir, "dense_warmup.json"), dense_stats)
 
     if args.warmup_episodes > 0:
         print(f"[warmup] episodes={args.warmup_episodes}")

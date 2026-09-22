@@ -171,6 +171,7 @@ class PPORoleRolloutBuffer:
         "maps", "preference", "previous_roles", "roles", "old_logprob", "value",
         "reward", "done", "duration", "budget", "next_maps",
         "next_previous_roles", "next_budget", "terminal_clean", "terminal_cov",
+        "dense_components",
     )
 
     def __init__(self):
@@ -183,6 +184,10 @@ class PPORoleRolloutBuffer:
         self.data = {name: [] for name in self.FIELDS}
 
     def store(self, **transition):
+        if "dense_components" not in transition:
+            # Backward-compatible for callers/checkpoints created before the
+            # optional dense reward layer. `none` mode ignores these zeros.
+            transition["dense_components"] = np.zeros(2, dtype=np.float32)
         missing = set(self.FIELDS) - set(transition)
         if missing:
             raise ValueError(f"Missing PPO rollout fields: {sorted(missing)}")
@@ -206,7 +211,12 @@ class PPORoleRolloutBuffer:
             return
         size = len(state.get("reward", []))
         for name in self.FIELDS:
-            default = [np.asarray(np.nan)] * size if name in {"terminal_clean", "terminal_cov"} else []
+            if name in {"terminal_clean", "terminal_cov"}:
+                default = [np.asarray(np.nan)] * size
+            elif name == "dense_components":
+                default = [np.zeros(2, dtype=np.float32)] * size
+            else:
+                default = []
             self.data[name] = [np.asarray(value).copy() for value in state.get(name, default)]
 
 
@@ -225,8 +235,8 @@ class PrioritizedHardRoleReplayBuffer:
         self.previous_roles = np.zeros((self.capacity, self.n_agents), dtype=np.int64)
         self.roles = np.zeros((self.capacity, self.n_agents), dtype=np.int64)
         self.next_previous_roles = np.zeros((self.capacity, self.n_agents), dtype=np.int64)
-        self.budget = np.zeros((self.capacity, self.n_agents, 1), dtype=np.float32)
-        self.next_budget = np.zeros((self.capacity, self.n_agents, 1), dtype=np.float32)
+        self.budget = np.zeros((self.capacity, self.n_agents, 2), dtype=np.float32)
+        self.next_budget = np.zeros((self.capacity, self.n_agents, 2), dtype=np.float32)
         self.rewards = np.zeros(self.capacity, dtype=np.float32)
         self.dones = np.zeros(self.capacity, dtype=np.float32)
         self.durations = np.ones(self.capacity, dtype=np.float32)
@@ -251,12 +261,11 @@ class PrioritizedHardRoleReplayBuffer:
 
     def _format_budget(self, budget):
         value = np.asarray(budget, dtype=np.float32)
-        if value.size == 1:
-            return np.full((self.n_agents, 1), float(value.reshape(-1)[0]), dtype=np.float32)
-        value = value.reshape(-1, 1)
-        if value.shape != (self.n_agents, 1):
-            raise ValueError(f"Expected one budget per agent [{self.n_agents},1], got {value.shape}")
-        return value
+        if value.shape == (self.n_agents, 2):
+            return value
+        if value.shape == (2,):
+            return np.tile(value, (self.n_agents, 1)).astype(np.float32)
+        raise ValueError(f"Expected budget shaped [{self.n_agents},2] (or shared [2]), got {value.shape}")
 
     def sample(self, batch_size: int, beta: float, device="cpu"):
         scaled = np.maximum(self.priorities[:self.size], self.eps) ** self.alpha

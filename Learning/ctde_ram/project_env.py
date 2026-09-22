@@ -191,6 +191,19 @@ class ProjectPatrollingCTDEEnv:
         remaining = 1.0 - distances / max(float(self.env.distance_budget), 1.0)
         return np.clip(remaining, 0.0, 1.0).astype(np.float32)
 
+    def episode_progress(self) -> float:
+        """Elapsed-step fraction of the episode.
+
+        Distinct from budget_fracs(): remaining budget tracks distance
+        traveled, while this tracks step count. The two diverge whenever a
+        step doesn't consume exactly one distance unit (e.g. collisions,
+        non-cardinal movement), so this is a separate, non-redundant signal
+        for the finite-horizon, non-stationary V(s).
+        """
+        steps = float(getattr(self.env, "steps", 0))
+        denom = max(float(self.env.distance_budget), 1.0)
+        return float(np.clip(steps / denom, 0.0, 1.0))
+
     def close(self):
         close = getattr(self.env, "close", None)
         if callable(close):

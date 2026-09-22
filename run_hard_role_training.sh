@@ -26,6 +26,7 @@ set -euo pipefail
 #   PPOT1VectorCriticDeltaAdvWPOP  same vector PPO using raw mission-metric deltas
 #   PPOT1D3PODelta  D3PO with delta metrics, vector critic, PopArt, and diversity loss
 #   PPOT1D3POComponents  same D3PO setup using component rewards
+#   PPOT1LogWPrefToken  PPO T1 with terminal weighted-log utility and preference token
 #   PPOT1VectorWPOP  short alias for PPOT1VectorCriticAdvWPOP
 #   PPOT1VectorWPOPToken  PPO T1 with vector critic, WPOP advantages, preference token and two attention layers, no popart
 #   PPOT1WP          PPO T1 with WP role-reward scalarization,
@@ -106,6 +107,10 @@ REF_AUTOCALIBRATE="${REF_AUTOCALIBRATE:-0}"
 STCH_MU="${STCH_MU:-0.1}"
 WPOP_EPS="${WPOP_EPS:-0.01}"
 PREF_WEIGHT_CLAMP="${PREF_WEIGHT_CLAMP:-0.05}"
+DENSE_REWARD_MODE="${DENSE_REWARD_MODE:-none}"
+DENSE_SCALARIZATION="${DENSE_SCALARIZATION:-sum}"
+DENSE_TERMINAL_RATIO="${DENSE_TERMINAL_RATIO:-0.2}"
+DENSE_WARMUP_EPISODES="${DENSE_WARMUP_EPISODES:-100}"
 DRY_RUN="${DRY_RUN:-0}"
 CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 PYTHONHASHSEED="${PYTHONHASHSEED:-${SEED}}"
@@ -116,6 +121,7 @@ N_ATTN_HEADS="${N_ATTN_HEADS:-4}"
 N_ATTN_LAYERS="${N_ATTN_LAYERS:-1}"
 ATTN_FF_DIM="${ATTN_FF_DIM:-128}"
 HARD_ROLE_PREFERENCE_CONDITIONING="${HARD_ROLE_PREFERENCE_CONDITIONING:-film}"
+WORLD_AGENT_SPLIT="${WORLD_AGENT_SPLIT:-0}"
 PPO_MINIBATCH_SIZE="${PPO_MINIBATCH_SIZE:-256}"
 PPO_ROLLOUT_MACRO_STEPS="${PPO_ROLLOUT_MACRO_STEPS:-2048}"
 DETERMINISTIC="${DETERMINISTIC:-1}"
@@ -169,6 +175,43 @@ case "${EXP}" in
         N_ATTN_LAYERS=2
         MODE_ARGS=(--ram-mode ppo_ram)
         ;;
+    ppot1wpoppreftokenmb512|ppo_t1_wpop_pref_token_mb512)
+        METHOD_TAG="PPO_RAM_PrefToken_AttnL2_T1_WPOP_MB512"
+        RUN_T_ROLE=1
+        ROLE_SCALARIZATION="wpop"
+        HARD_ROLE_PREFERENCE_CONDITIONING="pref_token"
+        HARD_ROLE_DEEP_INPUT_PROJECTIONS=1
+        N_ATTN_LAYERS=2
+        PPO_MINIBATCH_SIZE=512
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1wpoppreftokenl3d128h8ff256|ppo_t1_wpop_pref_token_l3_d128_h8_ff256)
+        METHOD_TAG="PPO_RAM_PrefToken_AttnL3_T1_WPOP_D128_H8_FF256"
+        RUN_T_ROLE=1
+        ROLE_SCALARIZATION="wpop"
+        RAM_REWARD_MODE="component_rewards"
+        ENTROPY_COEF=0.03
+        PPO_CRITIC_MODE="scalar"
+        PPO_CRITIC_POPART=0
+        PPO_ADVANTAGE_SCALARIZATION="ws"
+        HARD_ROLE_PREFERENCE_CONDITIONING="pref_token"
+        HARD_ROLE_DEEP_INPUT_PROJECTIONS=1
+        N_ATTN_LAYERS=3
+        D_MODEL=128
+        N_ATTN_HEADS=8
+        ATTN_FF_DIM=256
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1wpoppreftokenentropy005|ppo_t1_wpop_pref_token_entropy005)
+        METHOD_TAG="PPO_RAM_PrefToken_AttnL2_T1_WPOP_Entropy005"
+        RUN_T_ROLE=1
+        ROLE_SCALARIZATION="wpop"
+        ENTROPY_COEF=0.05
+        HARD_ROLE_PREFERENCE_CONDITIONING="pref_token"
+        HARD_ROLE_DEEP_INPUT_PROJECTIONS=0
+        N_ATTN_LAYERS=2
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
     ppot1wp|ppo_t1_wp)
         METHOD_TAG="PPO_RAM_FiLM_Attn_T1_WP"
         RUN_T_ROLE=1
@@ -196,6 +239,78 @@ case "${EXP}" in
         N_ATTN_LAYERS=2
         HARD_ROLE_DEEP_INPUT_PROJECTIONS=1
         REF_AUTOCALIBRATE=1
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1stchpreftoken|ppo_t1_stch_pref_token|stch_terminal)
+        METHOD_TAG="PPO_RAM_PrefToken_AttnL2_T1_STCHTerminal_AutoRef"
+        RUN_T_ROLE=1
+        RAM_REWARD_MODE="stch_terminal"
+        PPO_CRITIC_MODE="scalar"
+        PPO_CRITIC_POPART=0
+        PPO_ADVANTAGE_SCALARIZATION="ws"
+        HARD_ROLE_PREFERENCE_CONDITIONING="pref_token"
+        N_ATTN_LAYERS=2
+        HARD_ROLE_DEEP_INPUT_PROJECTIONS=1
+        REF_AUTOCALIBRATE=1
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1logwpreftoken|ppo_t1_logw_pref_token|logw_terminal)
+        METHOD_TAG="PPO_RAM_PrefToken_AttnL2_T1_LogWTerminal"
+        RUN_T_ROLE=1
+        RAM_REWARD_MODE="logw_terminal"
+        PPO_CRITIC_MODE="scalar"
+        PPO_CRITIC_POPART=0
+        PPO_ADVANTAGE_SCALARIZATION="ws"
+        HARD_ROLE_PREFERENCE_CONDITIONING="pref_token"
+        N_ATTN_LAYERS=2
+        HARD_ROLE_DEEP_INPUT_PROJECTIONS=1
+        REF_AUTOCALIBRATE=0
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1logwcontribution|ppo_t1_logw_contribution|logw_terminal_contribution)
+        METHOD_TAG="PPO_RAM_PrefToken_AttnL2_T1_LogWTerminal_DenseContribution_Rho02"
+        RUN_T_ROLE=1
+        RAM_REWARD_MODE="logw_terminal"
+        DENSE_REWARD_MODE="contribution"
+        DENSE_SCALARIZATION="sum"
+        DENSE_TERMINAL_RATIO=0.2
+        PPO_CRITIC_MODE="scalar"
+        PPO_CRITIC_POPART=0
+        PPO_ADVANTAGE_SCALARIZATION="ws"
+        HARD_ROLE_PREFERENCE_CONDITIONING="pref_token"
+        N_ATTN_LAYERS=2
+        HARD_ROLE_DEEP_INPUT_PROJECTIONS=1
+        REF_AUTOCALIBRATE=0
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1logwdelta|ppo_t1_logw_delta|logw_terminal_delta)
+        METHOD_TAG="PPO_RAM_PrefToken_AttnL2_T1_LogWTerminal_DenseDelta_Rho02"
+        RUN_T_ROLE=1
+        RAM_REWARD_MODE="logw_terminal"
+        DENSE_REWARD_MODE="delta"
+        DENSE_SCALARIZATION="sum"
+        DENSE_TERMINAL_RATIO=0.2
+        PPO_CRITIC_MODE="scalar"
+        PPO_CRITIC_POPART=0
+        PPO_ADVANTAGE_SCALARIZATION="ws"
+        HARD_ROLE_PREFERENCE_CONDITIONING="pref_token"
+        N_ATTN_LAYERS=2
+        HARD_ROLE_DEEP_INPUT_PROJECTIONS=1
+        REF_AUTOCALIBRATE=0
+        MODE_ARGS=(--ram-mode ppo_ram)
+        ;;
+    ppot1logwpreftokenentropy001|ppo_t1_logw_pref_token_entropy001|logw_terminal_entropy001)
+        METHOD_TAG="PPO_RAM_PrefToken_AttnL2_T1_LogWTerminal_Entropy001"
+        RUN_T_ROLE=1
+        RAM_REWARD_MODE="logw_terminal"
+        ENTROPY_COEF=0.01
+        PPO_CRITIC_MODE="scalar"
+        PPO_CRITIC_POPART=0
+        PPO_ADVANTAGE_SCALARIZATION="ws"
+        HARD_ROLE_PREFERENCE_CONDITIONING="pref_token"
+        N_ATTN_LAYERS=2
+        HARD_ROLE_DEEP_INPUT_PROJECTIONS=1
+        REF_AUTOCALIBRATE=0
         MODE_ARGS=(--ram-mode ppo_ram)
         ;;
     ppot1vectorwpop|ppo_t1_vector_wpop|ppot1vectorcriticadvwpop|ppo_t1_vector_critic_adv_wpop)
@@ -350,6 +465,12 @@ esac
 if [[ "${HARD_ROLE_DEEP_INPUT_PROJECTIONS}" == "1" ]]; then
     METHOD_TAG="${METHOD_TAG}_DeepInputProj"
 fi
+if [[ "${WORLD_AGENT_SPLIT}" == "1" ]]; then
+    METHOD_TAG="${METHOD_TAG}_WorldAgentSplit"
+fi
+if [[ "${PPO_CRITIC_MODE}" == "vector" ]]; then
+    METHOD_TAG="${METHOD_TAG}_VectorCriticFixed_Adv${PPO_ADVANTAGE_SCALARIZATION^^}"
+fi
 
 RUN_NAME_BASE="${MAP_NAME}_F4_${METHOD_TAG}_T${RUN_T_ROLE}_ep${EPISODES}_beta${WEIGHT_ALPHA}_s${SEED}"
 LOG_DIR="${PROJECT_ROOT}/${OUTPUT_DIR}/_tmux_logs"
@@ -427,6 +548,10 @@ COMMON_ARGS=(
     --stch-mu "${STCH_MU}"
     --wpop-eps "${WPOP_EPS}"
     --pref-weight-clamp "${PREF_WEIGHT_CLAMP}"
+    --dense-reward-mode "${DENSE_REWARD_MODE}"
+    --dense-scalarization "${DENSE_SCALARIZATION}"
+    --dense-terminal-ratio "${DENSE_TERMINAL_RATIO}"
+    --dense-warmup-episodes "${DENSE_WARMUP_EPISODES}"
     --d-model "${D_MODEL}"
     --n-attn-heads "${N_ATTN_HEADS}"
     --n-attn-layers "${N_ATTN_LAYERS}"
@@ -481,6 +606,9 @@ fi
 if [[ "${HARD_ROLE_DEEP_INPUT_PROJECTIONS}" == "1" ]]; then
     COMMON_ARGS+=(--hard-role-deep-input-projections)
 fi
+if [[ "${WORLD_AGENT_SPLIT}" == "1" ]]; then
+    COMMON_ARGS+=(--world-agent-split)
+fi
 if [[ "${DETERMINISTIC}" == "0" ]]; then
     COMMON_ARGS+=(--no-deterministic)
 fi
@@ -516,6 +644,7 @@ echo
 if [[ "${DRY_RUN}" == "1" ]]; then
     echo "[dry-run] No tmux session was started. Exact command:"
     sed -n '1,5p' "${CMD_FILE}"
+    rm -f "${CMD_FILE}"
     exit 0
 fi
 
