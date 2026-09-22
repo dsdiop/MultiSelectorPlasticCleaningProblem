@@ -284,6 +284,10 @@ class CTDERAMTrainer:
         stch_mu: float = 0.1,
         wpop_eps: float = 0.01,
         pref_weight_clamp: float = 0.05,
+        dense_reward_mode: str = "none",
+        dense_scalarization: str = "sum",
+        dense_terminal_ratio: float = 0.2,
+        dense_warmup_episodes: int = 100,
         # Main hard-role methods. The older modes below remain legacy-compatible.
         d_model: int = 64,
         n_attn_heads: int = 4,
@@ -292,6 +296,7 @@ class CTDERAMTrainer:
         preference_role_bias: bool = False,
         hard_role_preference_conditioning: str = "film",
         hard_role_deep_input_projections: bool = False,
+        hard_role_world_agent_split: bool = False,
         ppo_epochs: int = 4,
         ppo_minibatch_size: int = 128,
         ppo_rollout_macro_steps: int = 1024,
@@ -388,6 +393,35 @@ class CTDERAMTrainer:
         self.stch_mu = float(stch_mu)
         self.wpop_eps = float(wpop_eps)
         self.pref_weight_clamp = float(pref_weight_clamp)
+        self.dense_reward_mode = str(dense_reward_mode).lower()
+        self.dense_scalarization = str(dense_scalarization).lower()
+        self.dense_terminal_ratio = float(dense_terminal_ratio)
+        self.dense_warmup_episodes = int(dense_warmup_episodes)
+        valid_dense_modes = {"none", "contribution", "delta", "final_sum_normalized"}
+        valid_dense_scalarizations = {"sum", "ws", "wp", "wpop", "ewc"}
+        if self.dense_reward_mode not in valid_dense_modes:
+            raise ValueError(f"dense_reward_mode must be one of: {sorted(valid_dense_modes)}")
+        if self.dense_scalarization not in valid_dense_scalarizations:
+            raise ValueError(
+                f"dense_scalarization must be one of: {sorted(valid_dense_scalarizations)}"
+            )
+        if self.dense_terminal_ratio < 0.0:
+            raise ValueError("dense_terminal_ratio must be non-negative")
+        if self.dense_warmup_episodes < 0:
+            raise ValueError("dense_warmup_episodes must be non-negative")
+        companion_dense = {"contribution", "delta"}
+        if self.dense_reward_mode in companion_dense and self.ram_reward_mode not in terminal_modes:
+            raise ValueError(
+                "contribution/delta dense rewards require an active *_terminal ram_reward_mode"
+            )
+        if self.dense_reward_mode == "final_sum_normalized" and self.ram_reward_mode in terminal_modes:
+            raise ValueError(
+                "final_sum_normalized is standalone and cannot be combined with a *_terminal mode"
+            )
+        if self.dense_reward_mode != "none" and ram_mode != "ppo_ram":
+            raise ValueError("dense reward modes are currently supported only with ram_mode=ppo_ram")
+        if self.dense_reward_mode in companion_dense and self.dense_warmup_episodes <= 0:
+            raise ValueError("dense companion rewards require dense_warmup_episodes > 0")
         if self.chebyshev_ref_clean < 0.0 or self.chebyshev_ref_cov < 0.0:
             raise ValueError("Chebyshev reference values must be non-negative")
         if self.chebyshev_rho < 0.0:
@@ -411,6 +445,7 @@ class CTDERAMTrainer:
         self.hard_role_deep_input_projections = bool(
             hard_role_deep_input_projections
         )
+        self.hard_role_world_agent_split = bool(hard_role_world_agent_split)
         if self.hard_role_preference_conditioning not in {"film", "pref_token"}:
             raise ValueError(
                 "hard_role_preference_conditioning must be one of: film, pref_token"
@@ -569,6 +604,7 @@ class CTDERAMTrainer:
             ff_dim=attn_ff_dim, preference_role_bias=preference_role_bias,
             preference_conditioning=self.hard_role_preference_conditioning,
             deep_input_projections=self.hard_role_deep_input_projections,
+            world_agent_split=self.hard_role_world_agent_split,
         )
         self.ppo_actor = self.ppo_critic = self.ppo_learner = self.ppo_rollout = None
         self.hard_role_q = self.hard_role_q_learner = self.hard_role_replay = None
@@ -599,6 +635,9 @@ class CTDERAMTrainer:
                 stch_mu=self.stch_mu,
                 wpop_eps=self.wpop_eps,
                 pref_weight_clamp=self.pref_weight_clamp,
+                dense_reward_mode=self.dense_reward_mode,
+                dense_scalarization=self.dense_scalarization,
+                dense_terminal_ratio=self.dense_terminal_ratio,
             )
         elif self.ram_mode == "hard_role_q":
             self.hard_role_q = HardRoleQNetwork(**trunk_args).to(self.device)
@@ -801,7 +840,12 @@ class CTDERAMTrainer:
         return float(value)
 
     def _agent_budget_fracs(self, env) -> np.ndarray:
-        """Return one remaining-budget fraction per agent as [N,1]."""
+        """Return [remaining_budget_frac, episode_progress] per agent as [N,2].
+
+        Episode progress (elapsed steps / nominal horizon) is fleet-shared
+        (broadcast to every agent) since it isn't a per-agent quantity, but is
+        carried alongside budget through the same deep projection.
+        """
         value = getattr(env, "budget_fracs", None)
         if callable(value):
             budgets = np.asarray(value(), dtype=np.float32).reshape(-1)
@@ -811,7 +855,12 @@ class CTDERAMTrainer:
             budgets = np.full(
                 self.N, self._env_value(env, "budget_frac", 1.0), dtype=np.float32
             )
-        return np.clip(budgets, 0.0, 1.0).reshape(self.N, 1)
+        budgets = np.clip(budgets, 0.0, 1.0)
+        progress = np.full(
+            self.N, self._env_value(env, "episode_progress", 0.0), dtype=np.float32
+        )
+        progress = np.clip(progress, 0.0, 1.0)
+        return np.stack([budgets, progress], axis=-1)
 
     def _build_extra(self, env, r_accum, prev_W, scal_weights):
         # The extra vector is the non-neural mission context appended to the
@@ -1044,6 +1093,82 @@ class CTDERAMTrainer:
         return self.role_reward_norm.normalize_tensor(raw_scalar)
 
     # ---------- warmup ----------
+    @torch.no_grad()
+    def warmup_dense_reward(
+        self, env, n_episodes: int, weight_sampling: str = "beta",
+        weight_alpha: float = 0.4,
+    ):
+        """Measure episode-return ranges and terminal scale with sampled PPO roles."""
+        if self.dense_reward_mode not in {"contribution", "delta"}:
+            return None
+        if self.ram_mode != "ppo_ram" or self.ppo_learner is None:
+            raise ValueError("dense reward warmup requires ppo_ram")
+        if n_episodes <= 0:
+            raise ValueError("dense reward warmup requires at least one episode")
+        self._active_env = env
+        saved_rng = self._capture_evaluation_rng_state()
+        pref_rng = np.random.default_rng(self.seed)
+        episode_returns, terminal_abs = [], []
+        try:
+            for episode_i in _progress(
+                range(int(n_episodes)), desc="dense warmup", unit="ep", leave=False
+            ):
+                seed = self.seed + episode_i
+                obs_all = self._reset_evaluation_episode(env, seed)
+                if weight_sampling == "beta":
+                    preference = pref_rng.dirichlet(
+                        np.full(self.K, float(weight_alpha), dtype=np.float64)
+                    ).astype(np.float32)
+                else:
+                    preference = pref_rng.uniform(0.0, 1.0, size=self.K).astype(np.float32)
+                    preference /= max(float(preference.sum()), 1e-8)
+                previous_roles = np.zeros(self.N, dtype=np.int64)
+                objective_return = np.zeros(self.K, dtype=np.float64)
+                done = False
+                while not done:
+                    roles, _ = self._select_main_hard_roles(
+                        obs_all, previous_roles, preference, epsilon=0.0,
+                        training=True, return_attn=False,
+                    )
+                    roles_np = _tensor_to_numpy(roles, dtype=np.int64)
+                    duration = 0
+                    while duration < self.T_role and not done:
+                        obs_all, rewards, done, _, _ = self._step_env_with_hard_roles(
+                            env, obs_all, roles, epsilon_low=0.0
+                        )
+                        objective_return += _tensor_to_numpy(
+                            self._stack_rewards(rewards).sum(dim=0), dtype=np.float32
+                        )
+                        duration += 1
+                    previous_roles = roles_np
+                clean = self._env_value(env, "trash_cleaned_pct", 0.0)
+                cov = self._env_value(env, "coverage_pct", 0.0)
+                utility = self.ppo_learner.terminal_utility(
+                    [clean], [cov], np.asarray(preference)[None, :],
+                    update_reference=True,
+                )
+                episode_returns.append(objective_return)
+                terminal_abs.append(abs(float(utility.item())))
+        finally:
+            self._restore_evaluation_rng_state(saved_rng)
+
+        returns = np.asarray(episode_returns, dtype=np.float64)
+        terminal_scale = float(np.mean(terminal_abs))
+        return_min = returns.min(axis=0) if self.dense_reward_mode == "contribution" else None
+        return_max = returns.max(axis=0) if self.dense_reward_mode == "contribution" else None
+        self.ppo_learner.set_dense_reward_stats(return_min, return_max, terminal_scale)
+        stats = {
+            "episodes": int(n_episodes),
+            "return_min": None if return_min is None else return_min.tolist(),
+            "return_max": None if return_max is None else return_max.tolist(),
+            "terminal_scale": terminal_scale,
+            "beta": float(self.ppo_learner.dense_beta),
+            "weight_sampling": weight_sampling,
+            "weight_alpha": float(weight_alpha),
+        }
+        print(f"[dense:warmup] {stats}")
+        return stats
+
     @torch.no_grad()
     def warmup_normalizers(self, env, n_episodes: int = 5, max_steps_per_episode: Optional[int] = None) -> None:
         """Warm up PopArt and reward min/max stats before learning.
@@ -1520,12 +1645,19 @@ class CTDERAMTrainer:
 
             macro_reward, duration = 0.0, 0
             macro_reward_vector = np.zeros(self.K, dtype=np.float32)
+            dense_components = np.zeros(self.K, dtype=np.float32)
             while duration < self.T_role and not done:
                 obs_next, r_vecs, done, info, _ = self._step_env_with_hard_roles(
                     env, obs_all, roles, epsilon_low if training else 0.0
                 )
-                if self.ram_reward_mode == "component_rewards":
+                fleet_components = None
+                if self.ram_reward_mode == "component_rewards" or self.dense_reward_mode in {
+                    "contribution", "final_sum_normalized",
+                }:
                     fleet_components = self._stack_rewards(r_vecs).sum(dim=0)
+                if self.dense_reward_mode in {"contribution", "final_sum_normalized"}:
+                    dense_components += _tensor_to_numpy(fleet_components, dtype=np.float32)
+                if self.ram_reward_mode == "component_rewards":
                     # Component rewards retain the original discounted
                     # within-window accumulation and optional min-max scaling.
                     scalar_step = self._scalarize_role_reward(
@@ -1551,7 +1683,8 @@ class CTDERAMTrainer:
                 duration += 1
                 ep_step += 1
 
-            if self.ram_reward_mode == "delta_metrics":
+            window_end_metrics = None
+            if self.ram_reward_mode == "delta_metrics" or self.dense_reward_mode == "delta":
                 # One raw mission-progress vector per macro transition. Do not
                 # scalarize or normalize it before vector GAE; the PPO learner
                 # standardizes advantages independently per objective.
@@ -1566,6 +1699,9 @@ class CTDERAMTrainer:
                 delta_components = self._metric_reward_components(
                     window_start_metrics, window_end_metrics
                 )
+                if self.dense_reward_mode == "delta":
+                    dense_components = _tensor_to_numpy(delta_components, dtype=np.float32)
+            if self.ram_reward_mode == "delta_metrics":
                 macro_reward_vector = _tensor_to_numpy(delta_components, dtype=np.float32)
                 # Kept only for scalar-critic/HardRoleQ compatibility and
                 # reporting. Vector PPO stores macro_reward_vector below.
@@ -1608,6 +1744,7 @@ class CTDERAMTrainer:
                         self._env_value(env, "coverage_pct", float(info.get("coverage", 0.0)))
                         if done else np.nan
                     ),
+                    dense_components=dense_components,
                 )
             elif training:
                 self.hard_role_replay.store(
@@ -2608,7 +2745,12 @@ class CTDERAMTrainer:
                 "pref_weight_clamp": self.pref_weight_clamp,
                 "hard_role_preference_conditioning": self.hard_role_preference_conditioning,
                 "hard_role_deep_input_projections": self.hard_role_deep_input_projections,
+                "hard_role_world_agent_split": self.hard_role_world_agent_split,
                 "ram_reward_mode": self.ram_reward_mode,
+                "dense_reward_mode": self.dense_reward_mode,
+                "dense_scalarization": self.dense_scalarization,
+                "dense_terminal_ratio": self.dense_terminal_ratio,
+                "dense_warmup_episodes": self.dense_warmup_episodes,
                 "global_agg_mode": self.global_agg_mode,
                 "low_level_backend": self.low_level_backend,
                 "freeze_low_level": self.freeze_low_level,
@@ -2651,6 +2793,20 @@ class CTDERAMTrainer:
                     None if self.ppo_learner is None else {
                         "clean": self.ppo_learner.running_ref_clean,
                         "cov": self.ppo_learner.running_ref_cov,
+                    }
+                ),
+                "dense_reward": (
+                    None if self.ppo_learner is None else {
+                        "return_min": (
+                            None if self.ppo_learner.dense_return_min is None
+                            else self.ppo_learner.dense_return_min.detach().cpu().tolist()
+                        ),
+                        "return_max": (
+                            None if self.ppo_learner.dense_return_max is None
+                            else self.ppo_learner.dense_return_max.detach().cpu().tolist()
+                        ),
+                        "terminal_scale": self.ppo_learner.dense_terminal_scale,
+                        "beta": self.ppo_learner.dense_beta,
                     }
                 ),
                 "switch_penalty_reward_scale": {
@@ -2707,6 +2863,12 @@ class CTDERAMTrainer:
                 )
                 self.ppo_learner.running_ref_cov = max(
                     self.ppo_learner.running_ref_cov, float(utility_ref["cov"])
+                )
+            dense_state = ckpt.get("normalizers", {}).get("dense_reward")
+            if dense_state and dense_state.get("terminal_scale") is not None:
+                self.ppo_learner.set_dense_reward_stats(
+                    dense_state.get("return_min"), dense_state.get("return_max"),
+                    dense_state["terminal_scale"],
                 )
         self._load_role_reward_norm_state(ckpt.get("normalizers", {}).get("role_reward"))
         switch_scale = ckpt.get("normalizers", {}).get("switch_penalty_reward_scale", {})
